@@ -34,16 +34,17 @@ mod unix_main {
     use crate::session_manager::new_shared_state;
     use serde_json::{json, Value};
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     pub fn main() {
         let args = std::env::args().collect::<Vec<_>>();
         if args.len() < 2 {
-            eprintln!("usage: discode-pty-sidecar <server|request> ...");
+            eprintln!("usage: discode-pty-sidecar <server|request|client> ...");
             std::process::exit(1);
         }
 
@@ -80,6 +81,16 @@ mod unix_main {
                         eprintln!("request error: {err}");
                         std::process::exit(1);
                     }
+                }
+            }
+            "client" => {
+                let socket = parse_flag(&args, "--socket").unwrap_or_else(|| {
+                    eprintln!("missing --socket");
+                    std::process::exit(1);
+                });
+                if let Err(err) = run_client(PathBuf::from(socket)) {
+                    eprintln!("client error: {err}");
+                    std::process::exit(1);
                 }
             }
             _ => {
@@ -131,36 +142,60 @@ mod unix_main {
                 Err(err) => return Err(format!("accept failed: {err}")),
             };
 
-            let mut raw = String::new();
-            if let Err(err) = stream.read_to_string(&mut raw) {
+            if let Err(err) = handle_connection(&mut stream, &state, &running) {
                 let _ = write_response(
                     &mut stream,
                     &RpcResponse {
                         ok: false,
                         result: None,
-                        error: Some(format!("failed to read request: {err}")),
+                        error: Some(err),
                     },
                 );
-                continue;
+            }
+        }
+
+        let _ = fs::remove_file(&socket_path);
+        Ok(())
+    }
+
+    fn write_response(stream: &mut UnixStream, response: &RpcResponse) -> Result<(), String> {
+        let mut payload =
+            serde_json::to_vec(response).map_err(|e| format!("encode response: {e}"))?;
+        payload.push(b'\n');
+        stream
+            .write_all(&payload)
+            .map_err(|e| format!("write response: {e}"))
+    }
+
+    fn handle_connection(
+        stream: &mut UnixStream,
+        state: &crate::session_manager::SharedSidecarState,
+        running: &Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        let reader_stream = stream
+            .try_clone()
+            .map_err(|e| format!("clone stream for read failed: {e}"))?;
+        let mut reader = BufReader::new(reader_stream);
+
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                break;
             }
 
-            let req = match serde_json::from_str::<RpcRequest>(&raw) {
-                Ok(req) => req,
-                Err(err) => {
-                    let _ = write_response(
-                        &mut stream,
-                        &RpcResponse {
-                            ok: false,
-                            result: None,
-                            error: Some(format!("invalid request JSON: {err}")),
-                        },
-                    );
-                    continue;
-                }
-            };
+            let mut raw = String::new();
+            let read = reader
+                .read_line(&mut raw)
+                .map_err(|e| format!("failed to read request: {e}"))?;
+
+            if read == 0 {
+                break;
+            }
+
+            let req = serde_json::from_str::<RpcRequest>(raw.trim())
+                .map_err(|e| format!("invalid request JSON: {e}"))?;
 
             let mut should_shutdown = false;
-            let response = match handle_request(&state, req, &mut should_shutdown) {
+            let response = match handle_request(state, req, &mut should_shutdown) {
                 Ok(value) => RpcResponse {
                     ok: true,
                     result: Some(value),
@@ -173,21 +208,64 @@ mod unix_main {
                 },
             };
 
-            let _ = write_response(&mut stream, &response);
+            write_response(stream, &response)?;
             if should_shutdown {
                 running.store(false, Ordering::SeqCst);
+                break;
             }
         }
 
-        let _ = fs::remove_file(&socket_path);
         Ok(())
     }
 
-    fn write_response(stream: &mut UnixStream, response: &RpcResponse) -> Result<(), String> {
-        let payload = serde_json::to_vec(response).map_err(|e| format!("encode response: {e}"))?;
-        stream
-            .write_all(&payload)
-            .map_err(|e| format!("write response: {e}"))
+    fn run_client(socket_path: PathBuf) -> Result<(), String> {
+        let mut stream = UnixStream::connect(&socket_path)
+            .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(5000)));
+
+        let reader_stream = stream
+            .try_clone()
+            .map_err(|e| format!("clone stream for client read failed: {e}"))?;
+        let mut socket_reader = BufReader::new(reader_stream);
+
+        let stdin = std::io::stdin();
+        let mut stdin_reader = BufReader::new(stdin.lock());
+        let mut stdout = std::io::stdout();
+
+        loop {
+            let mut inbound = String::new();
+            let read = stdin_reader
+                .read_line(&mut inbound)
+                .map_err(|e| format!("read stdin failed: {e}"))?;
+            if read == 0 {
+                break;
+            }
+
+            if inbound.trim().is_empty() {
+                continue;
+            }
+
+            stream
+                .write_all(inbound.as_bytes())
+                .map_err(|e| format!("write to sidecar failed: {e}"))?;
+
+            let mut outbound = String::new();
+            let received = socket_reader
+                .read_line(&mut outbound)
+                .map_err(|e| format!("read from sidecar failed: {e}"))?;
+            if received == 0 {
+                return Err("sidecar closed connection".to_string());
+            }
+
+            stdout
+                .write_all(outbound.as_bytes())
+                .map_err(|e| format!("write stdout failed: {e}"))?;
+            stdout
+                .flush()
+                .map_err(|e| format!("flush stdout failed: {e}"))?;
+        }
+
+        Ok(())
     }
 }
 

@@ -51,7 +51,7 @@ Exit criteria:
 
 ## Phase 2 - Runtime Transport and Execution Model Hardening
 
-- [ ] replace request-per-process client pattern with persistent RPC connection model
+- [x] replace request-per-process client pattern with persistent RPC connection model (persistent `client` bridge + line-delimited RPC over single socket connection)
 - [ ] introduce request ids, timeouts, and explicit error codes
 - [ ] implement sidecar heartbeat/health method
 - [ ] add controlled shutdown and socket/pipe cleanup guarantees
@@ -59,7 +59,7 @@ Exit criteria:
 
 Exit criteria:
 
-- [ ] no per-request `spawnSync` in steady state path
+- [x] no per-request `spawnSync` in steady state path (persistent bridge path; one-shot request fallback retained for compatibility)
 - [ ] request tail latency improves versus PoC baseline
 
 ## Phase 3 - Terminal Engine Fidelity (Zellij-like terminal pane behavior)

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readSync, writeSync } from 'fs';
 import { join } from 'path';
 import { homedir, tmpdir } from 'os';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
@@ -22,6 +22,11 @@ export class RustSidecarClient {
   private socketPath: string;
   private startupTimeoutMs: number;
   private serverProcess?: ChildProcess;
+  private clientProcess?: ChildProcess;
+  private clientStdinFd?: number;
+  private clientStdoutFd?: number;
+  private clientReadBuffer = Buffer.alloc(0);
+  private requestTimeoutMs = 1500;
   private available = false;
 
   constructor(options?: SidecarOptions) {
@@ -70,10 +75,12 @@ export class RustSidecarClient {
   }
 
   listWindows(sessionName?: string): RuntimeWindowSnapshot[] {
-    const result = this.request<{ windows?: Array<RuntimeWindowSnapshot & {
-      startedAt?: number;
-      exitedAt?: number;
-    }> }>('list_windows', { sessionName });
+    const result = this.request<{
+      windows?: Array<RuntimeWindowSnapshot & {
+        startedAt?: number;
+        exitedAt?: number;
+      }>;
+    }>('list_windows', { sessionName });
     return (result.windows || []).map((item) => ({
       sessionName: item.sessionName,
       windowName: item.windowName,
@@ -113,23 +120,37 @@ export class RustSidecarClient {
   }
 
   dispose(): void {
-    if (!this.available || !this.binaryPath) return;
-    try {
-      this.request('dispose', {});
-    } catch {
-      // best effort
+    if (this.available && this.binaryPath) {
+      try {
+        this.request('dispose', {});
+      } catch {
+        // best effort
+      }
     }
+
+    this.stopClientBridge();
+
     if (this.serverProcess && !this.serverProcess.killed) {
       this.serverProcess.kill('SIGTERM');
     }
+
     this.available = false;
   }
 
   private tryConnectOrStart(): boolean {
     if (!this.binaryPath) return false;
 
+    if (this.startClientBridge()) {
+      try {
+        this.request('hello', {}, true);
+        return true;
+      } catch {
+        this.stopClientBridge();
+      }
+    }
+
     try {
-      this.request('hello', {}, true);
+      this.requestViaCommand('hello', {});
       return true;
     } catch {
       // try server spawn next
@@ -155,24 +176,110 @@ export class RustSidecarClient {
 
     const start = Date.now();
     while (Date.now() - start < this.startupTimeoutMs) {
+      if (!this.startClientBridge()) {
+        try {
+          this.requestViaCommand('hello', {});
+          return true;
+        } catch {
+          continue;
+        }
+      }
+
       try {
         this.request('hello', {}, true);
         return true;
       } catch {
-        // retry
+        this.stopClientBridge();
       }
     }
 
     if (this.serverProcess && !this.serverProcess.killed) {
       this.serverProcess.kill('SIGTERM');
     }
+
     return false;
+  }
+
+  private startClientBridge(): boolean {
+    if (this.clientProcess && !this.clientProcess.killed && this.clientStdinFd !== undefined && this.clientStdoutFd !== undefined) {
+      return true;
+    }
+
+    if (!this.binaryPath) return false;
+
+    this.stopClientBridge();
+
+    let bridge: ChildProcess;
+    try {
+      bridge = spawn(this.binaryPath, ['client', '--socket', this.socketPath], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+    } catch {
+      return false;
+    }
+
+    const stdinFd = getStreamFd(bridge.stdin as unknown as { _handle?: { fd?: number } });
+    const stdoutFd = getStreamFd(bridge.stdout as unknown as { _handle?: { fd?: number } });
+
+    if (stdinFd === null || stdoutFd === null) {
+      if (!bridge.killed) bridge.kill('SIGTERM');
+      return false;
+    }
+
+    this.clientProcess = bridge;
+    this.clientStdinFd = stdinFd;
+    this.clientStdoutFd = stdoutFd;
+    this.clientReadBuffer = Buffer.alloc(0);
+    return true;
+  }
+
+  private stopClientBridge(): void {
+    if (this.clientProcess && !this.clientProcess.killed) {
+      this.clientProcess.kill('SIGTERM');
+    }
+    this.clientProcess = undefined;
+    this.clientStdinFd = undefined;
+    this.clientStdoutFd = undefined;
+    this.clientReadBuffer = Buffer.alloc(0);
   }
 
   private request<T = unknown>(method: string, params?: Record<string, unknown>, ignoreAvailable = false): T {
     if (!ignoreAvailable && (!this.available || !this.binaryPath)) {
       throw new Error('Rust sidecar unavailable');
     }
+    if (!this.binaryPath) {
+      throw new Error('Rust sidecar binary not configured');
+    }
+
+    if (!this.startClientBridge() || this.clientStdinFd === undefined || this.clientStdoutFd === undefined) {
+      return this.requestViaCommand(method, params || {});
+    }
+
+    const payload = `${JSON.stringify({ method, params: params || {} })}\n`;
+
+    try {
+      writeAllSync(this.clientStdinFd, Buffer.from(payload, 'utf8'));
+      const line = this.readClientLine();
+      let parsed: SidecarRpcResponse<T>;
+
+      try {
+        parsed = JSON.parse(line) as SidecarRpcResponse<T>;
+      } catch {
+        throw new Error(`invalid sidecar response for ${method}: ${normalizeLogText(line) || 'empty response'}`);
+      }
+
+      if (!parsed.ok) {
+        throw new Error(parsed.error || `sidecar error for ${method}`);
+      }
+
+      return parsed.result as T;
+    } catch (error) {
+      this.stopClientBridge();
+      throw new Error(`sidecar request failed (${method}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private requestViaCommand<T = unknown>(method: string, params?: Record<string, unknown>): T {
     if (!this.binaryPath) {
       throw new Error('Rust sidecar binary not configured');
     }
@@ -219,7 +326,7 @@ export class RustSidecarClient {
 
     let payload: SidecarRpcResponse<T>;
     try {
-      payload = JSON.parse(result.stdout || '{}') as SidecarRpcResponse<T>;
+      payload = JSON.parse((result.stdout || '').trim()) as SidecarRpcResponse<T>;
     } catch {
       throw new Error(`invalid sidecar response for ${method}: ${normalizeLogText(result.stdout || '') || 'empty stdout'}`);
     }
@@ -229,6 +336,82 @@ export class RustSidecarClient {
     }
 
     return payload.result as T;
+  }
+
+  private readClientLine(): string {
+    if (this.clientStdoutFd === undefined) {
+      throw new Error('client stdout unavailable');
+    }
+
+    const deadline = Date.now() + this.requestTimeoutMs;
+
+    for (;;) {
+      const newlineIndex = this.clientReadBuffer.indexOf(0x0a);
+      if (newlineIndex >= 0) {
+        const line = this.clientReadBuffer.subarray(0, newlineIndex).toString('utf8').trim();
+        this.clientReadBuffer = this.clientReadBuffer.subarray(newlineIndex + 1);
+        return line;
+      }
+
+      const chunk = Buffer.allocUnsafe(4096);
+      let bytesRead = 0;
+      try {
+        bytesRead = readSync(this.clientStdoutFd, chunk, 0, chunk.length, null);
+      } catch (error) {
+        if (isRetryableReadError(error) && Date.now() < deadline) {
+          sleepSync(5);
+          continue;
+        }
+        throw error;
+      }
+
+      if (bytesRead === 0) {
+        throw new Error('sidecar client bridge closed stdout');
+      }
+
+      this.clientReadBuffer = Buffer.concat([
+        this.clientReadBuffer,
+        chunk.subarray(0, bytesRead),
+      ]);
+
+      if (this.clientReadBuffer.length > 4 * 1024 * 1024) {
+        throw new Error('sidecar client bridge response exceeded 4MiB');
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error('timed out waiting for sidecar client bridge response');
+      }
+    }
+  }
+}
+
+function isRetryableReadError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as { code?: string }).code;
+  return code === 'EAGAIN' || code === 'EWOULDBLOCK';
+}
+
+function sleepSync(ms: number): void {
+  const lock = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(lock, 0, 0, ms);
+}
+
+function getStreamFd(stream: { _handle?: { fd?: number } } | null | undefined): number | null {
+  const fd = stream?._handle?.fd;
+  if (typeof fd !== 'number' || !Number.isFinite(fd)) {
+    return null;
+  }
+  return fd;
+}
+
+function writeAllSync(fd: number, buf: Buffer): void {
+  let offset = 0;
+  while (offset < buf.length) {
+    const written = writeSync(fd, buf, offset, buf.length - offset);
+    if (written <= 0) {
+      throw new Error('failed to write request payload');
+    }
+    offset += written;
   }
 }
 

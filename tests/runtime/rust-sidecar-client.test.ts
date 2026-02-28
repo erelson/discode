@@ -29,12 +29,8 @@ const getFlag = (name) => {
 if (args[0] === 'server') {
   process.on('SIGTERM', () => process.exit(0));
   setInterval(() => {}, 1000);
-} else if (args[0] === 'request') {
-  const method = getFlag('--method');
-  const paramsRaw = getFlag('--params') || '{}';
-  let params = {};
-  try { params = JSON.parse(paramsRaw); } catch {}
-
+} else if (args[0] === 'request' || args[0] === 'client') {
+  const buildResult = (method, params) => {
   let result = {};
   if (method === 'hello') result = { version: 1 };
   else if (method === 'get_or_create_session') result = { sessionName: params.projectName || 'unknown' };
@@ -60,7 +56,35 @@ if (args[0] === 'server') {
   else if (method === 'stop_window') result = { stopped: true };
   else result = { ok: true };
 
-  process.stdout.write(JSON.stringify({ ok: true, result }));
+  return result;
+  };
+
+  if (args[0] === 'request') {
+    const method = getFlag('--method');
+    const paramsRaw = getFlag('--params') || '{}';
+    let params = {};
+    try { params = JSON.parse(paramsRaw); } catch {}
+
+    if (method !== 'hello') {
+      process.stderr.write('request mode only supports hello');
+      process.exit(2);
+    }
+
+    process.stdout.write(JSON.stringify({ ok: true, result: buildResult(method, params) }));
+  } else {
+    const readline = require('node:readline');
+    const rl = readline.createInterface({ input: process.stdin, terminal: false });
+    rl.on('line', (line) => {
+      let payload = {};
+      try { payload = JSON.parse(line); } catch {
+        process.stdout.write(JSON.stringify({ ok: false, error: 'invalid request' }) + '\\n');
+        return;
+      }
+      const method = payload.method || '';
+      const params = payload.params || {};
+      process.stdout.write(JSON.stringify({ ok: true, result: buildResult(method, params) }) + '\\n');
+    });
+  }
 } else {
   process.stderr.write('unknown command');
   process.exit(1);
