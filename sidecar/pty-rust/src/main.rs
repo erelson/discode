@@ -445,6 +445,151 @@ mod unix_main {
             .map(|d| d.as_secs() as i64)
             .unwrap_or_default()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::thread;
+        use std::time::Duration;
+
+        struct Cleanup(SharedSidecarState);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let mut should_shutdown = false;
+                let _ = handle_request(
+                    &self.0,
+                    RpcRequest {
+                        method: "dispose".to_string(),
+                        params: json!({}),
+                    },
+                    &mut should_shutdown,
+                );
+            }
+        }
+
+        fn call(state: &SharedSidecarState, method: &str, params: Value) -> Value {
+            let mut should_shutdown = false;
+            handle_request(
+                state,
+                RpcRequest {
+                    method: method.to_string(),
+                    params,
+                },
+                &mut should_shutdown,
+            )
+            .unwrap_or_else(|err| panic!("{method} failed: {err}"))
+        }
+
+        #[test]
+        fn preserves_session_and_window_registry_methods() {
+            let state = new_shared_state();
+            let _cleanup = Cleanup(state.clone());
+
+            let created = call(
+                &state,
+                "get_or_create_session",
+                json!({ "projectName": "proj-a", "firstWindowName": "win-a" }),
+            );
+            assert_eq!(created["sessionName"].as_str(), Some("proj-a"));
+
+            let exists = call(
+                &state,
+                "window_exists",
+                json!({ "sessionName": "proj-a", "windowName": "win-a" }),
+            );
+            assert_eq!(exists["exists"].as_bool(), Some(true));
+
+            let listed = call(&state, "list_windows", json!({ "sessionName": "proj-a" }));
+            let windows = listed["windows"]
+                .as_array()
+                .expect("windows should be array");
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0]["status"].as_str(), Some("idle"));
+        }
+
+        #[test]
+        fn preserves_window_io_methods_through_pty_bus() {
+            let state = new_shared_state();
+            let _cleanup = Cleanup(state.clone());
+
+            call(
+                &state,
+                "get_or_create_session",
+                json!({ "projectName": "proj-b", "firstWindowName": "win-b" }),
+            );
+
+            call(
+                &state,
+                "start_window",
+                json!({
+                    "sessionName": "proj-b",
+                    "windowName": "win-b",
+                    "command": "cat"
+                }),
+            );
+
+            call(
+                &state,
+                "type_keys",
+                json!({
+                    "sessionName": "proj-b",
+                    "windowName": "win-b",
+                    "keys": "hello-rpc"
+                }),
+            );
+            call(
+                &state,
+                "send_enter",
+                json!({ "sessionName": "proj-b", "windowName": "win-b" }),
+            );
+
+            let mut saw_echo = false;
+            for _ in 0..40 {
+                let buffer = call(
+                    &state,
+                    "get_window_buffer",
+                    json!({ "sessionName": "proj-b", "windowName": "win-b" }),
+                );
+                if buffer["buffer"]
+                    .as_str()
+                    .map(|text| text.contains("hello-rpc"))
+                    .unwrap_or(false)
+                {
+                    saw_echo = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(saw_echo, "expected echoed input in window buffer");
+
+            call(
+                &state,
+                "resize_window",
+                json!({
+                    "sessionName": "proj-b",
+                    "windowName": "win-b",
+                    "cols": 100,
+                    "rows": 30
+                }),
+            );
+
+            let frame = call(
+                &state,
+                "get_window_frame",
+                json!({ "sessionName": "proj-b", "windowName": "win-b" }),
+            );
+            assert_eq!(frame["cols"].as_u64(), Some(100));
+            assert_eq!(frame["rows"].as_u64(), Some(30));
+
+            let stopped = call(
+                &state,
+                "stop_window",
+                json!({ "sessionName": "proj-b", "windowName": "win-b" }),
+            );
+            assert_eq!(stopped["stopped"].as_bool(), Some(true));
+        }
+    }
 }
 
 #[cfg(unix)]

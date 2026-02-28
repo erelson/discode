@@ -41,8 +41,8 @@ Exit criteria:
 - [x] move window/session state out of `main.rs` into `session_manager` (state structs/registry + locking/window access helpers moved)
 - [x] move PTY spawn/read/write/resize into `pty_bus` (`spawn_window_process`, `write_input`, `resize_window`, `stop_window`, `dispose_window`)
 - [x] move VT-lite parser logic into `terminal_pane` + `grid_scrollback` (kept `vt_lite` as compatibility adapter)
-- [ ] keep existing RPC methods working via adapters
-- [ ] add integration tests to prove behavior equivalence after moves
+- [x] keep existing RPC methods working via adapters (`vt_lite` compatibility adapter -> `terminal_pane::build_styled_frame`)
+- [x] add integration tests to prove behavior equivalence after moves (`unix_main` RPC/session/window integration tests)
 
 Exit criteria:
 
