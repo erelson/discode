@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock file downloader
-const mockDownloadFileAttachments = vi.fn().mockResolvedValue([]);
+const mockDownloadFileAttachments = vi.fn().mockResolvedValue({ downloaded: [], skipped: [] });
 const mockBuildFileMarkers = vi.fn().mockReturnValue('');
 
 vi.mock('../../src/infra/file-downloader.js', () => ({
@@ -62,6 +62,9 @@ describe('BridgeMessageRouter container file injection', () => {
     };
     pendingTracker = {
       markPending: vi.fn().mockResolvedValue(undefined),
+      ensurePending: vi.fn().mockResolvedValue(undefined),
+      setPromptPreview: vi.fn(),
+      ensureStartMessage: vi.fn().mockResolvedValue(undefined),
       markError: vi.fn().mockResolvedValue(undefined),
       markCompleted: vi.fn().mockResolvedValue(undefined),
     };
@@ -71,6 +74,7 @@ describe('BridgeMessageRouter container file injection', () => {
       runtime,
       stateManager,
       pendingTracker,
+      streamingUpdater: { canStream: vi.fn(), start: vi.fn(), append: vi.fn(), finalize: vi.fn(), discard: vi.fn(), has: vi.fn() } as any,
       sanitizeInput: (content: string) => content.trim() || null,
     });
 
@@ -103,7 +107,7 @@ describe('BridgeMessageRouter container file injection', () => {
     const downloadedFiles = [
       { localPath: '/test/path/.discode/files/img.png', originalName: 'img.png', contentType: 'image/png' },
     ];
-    mockDownloadFileAttachments.mockResolvedValue(downloadedFiles);
+    mockDownloadFileAttachments.mockResolvedValue({ downloaded: downloadedFiles, skipped: [] });
     mockBuildFileMarkers.mockReturnValue('\n[file:/test/path/.discode/files/img.png]');
 
     const attachments = [
@@ -143,7 +147,7 @@ describe('BridgeMessageRouter container file injection', () => {
     const downloadedFiles = [
       { localPath: '/test/path/.discode/files/img.png', originalName: 'img.png', contentType: 'image/png' },
     ];
-    mockDownloadFileAttachments.mockResolvedValue(downloadedFiles);
+    mockDownloadFileAttachments.mockResolvedValue({ downloaded: downloadedFiles, skipped: [] });
     mockBuildFileMarkers.mockReturnValue('\n[file:/test/path/.discode/files/img.png]');
 
     const attachments = [
@@ -154,5 +158,169 @@ describe('BridgeMessageRouter container file injection', () => {
 
     // Should NOT inject file into container
     expect(mockInjectFile).not.toHaveBeenCalled();
+  });
+
+  it('does not create start message from router path', async () => {
+    const project = normalizeProjectState({
+      projectName: 'test',
+      projectPath: '/test/path',
+      tmuxSession: 'session',
+      discordChannels: { codex: 'ch-codex' },
+      agents: { codex: true },
+      instances: {
+        codex: {
+          instanceId: 'codex',
+          agentType: 'codex',
+          tmuxWindow: 'test-codex',
+          channelId: 'ch-codex',
+        },
+      },
+      createdAt: new Date(),
+      lastActive: new Date(),
+    });
+    stateManager.getProject.mockReturnValue(project);
+
+    await messageCallback('codex', '흠', 'test', 'ch-codex', 'msg-1');
+
+    expect(pendingTracker.setPromptPreview).toHaveBeenCalledWith('test', 'codex', '흠', 'codex');
+    expect(pendingTracker.ensureStartMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('BridgeMessageRouter SDK routing', () => {
+  let messaging: any;
+  let runtime: any;
+  let stateManager: any;
+  let pendingTracker: any;
+  let router: BridgeMessageRouter;
+  let messageCallback: Function;
+  let mockGetSdkRunner: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    messaging = createMockMessaging();
+    runtime = createMockRuntime();
+    stateManager = {
+      getProject: vi.fn(),
+      updateLastActive: vi.fn(),
+    };
+    pendingTracker = {
+      markPending: vi.fn().mockResolvedValue(undefined),
+      ensurePending: vi.fn().mockResolvedValue(undefined),
+      setPromptPreview: vi.fn(),
+      ensureStartMessage: vi.fn().mockResolvedValue(undefined),
+      markError: vi.fn().mockResolvedValue(undefined),
+      markCompleted: vi.fn().mockResolvedValue(undefined),
+      getPending: vi.fn().mockReturnValue(undefined),
+      hasPending: vi.fn().mockReturnValue(false),
+    };
+    mockGetSdkRunner = vi.fn();
+
+    router = new BridgeMessageRouter({
+      messaging,
+      runtime,
+      stateManager,
+      pendingTracker,
+      streamingUpdater: { canStream: vi.fn(), start: vi.fn(), append: vi.fn(), finalize: vi.fn(), discard: vi.fn(), has: vi.fn() } as any,
+      sanitizeInput: (content: string) => content.trim() || null,
+      getSdkRunner: mockGetSdkRunner,
+    });
+
+    router.register();
+    messageCallback = messaging.onMessage.mock.calls[0][0];
+  });
+
+  it('routes to SDK runner when runtimeType is sdk', async () => {
+    const mockRunner = { submitMessage: vi.fn().mockResolvedValue(undefined) };
+    mockGetSdkRunner.mockReturnValue(mockRunner);
+
+    const project = normalizeProjectState({
+      projectName: 'test',
+      projectPath: '/test/path',
+      tmuxSession: 'session',
+      discordChannels: { claude: 'ch-1' },
+      agents: { claude: true },
+      instances: {
+        claude: {
+          instanceId: 'claude',
+          agentType: 'claude',
+          tmuxWindow: 'test-claude',
+          channelId: 'ch-1',
+          runtimeType: 'sdk',
+        },
+      },
+      createdAt: new Date(),
+      lastActive: new Date(),
+    });
+    stateManager.getProject.mockReturnValue(project);
+
+    await messageCallback('claude', 'hello sdk', 'test', 'ch-1');
+
+    expect(mockGetSdkRunner).toHaveBeenCalledWith('test', 'claude');
+    expect(mockRunner.submitMessage).toHaveBeenCalledWith('hello sdk');
+
+    // Should NOT use tmux runtime
+    expect(runtime.typeKeysToWindow).not.toHaveBeenCalled();
+    expect(runtime.sendKeysToWindow).not.toHaveBeenCalled();
+  });
+
+  it('sends error when SDK runner is not found', async () => {
+    mockGetSdkRunner.mockReturnValue(undefined);
+
+    const project = normalizeProjectState({
+      projectName: 'test',
+      projectPath: '/test/path',
+      tmuxSession: 'session',
+      discordChannels: { claude: 'ch-1' },
+      agents: { claude: true },
+      instances: {
+        claude: {
+          instanceId: 'claude',
+          agentType: 'claude',
+          tmuxWindow: 'test-claude',
+          channelId: 'ch-1',
+          runtimeType: 'sdk',
+        },
+      },
+      createdAt: new Date(),
+      lastActive: new Date(),
+    });
+    stateManager.getProject.mockReturnValue(project);
+
+    await messageCallback('claude', 'hello', 'test', 'ch-1');
+
+    expect(pendingTracker.markError).toHaveBeenCalled();
+    expect(messaging.sendToChannel).toHaveBeenCalledWith(
+      'ch-1',
+      expect.stringContaining('SDK runner not found'),
+    );
+  });
+
+  it('uses tmux path when runtimeType is not sdk', async () => {
+    const project = normalizeProjectState({
+      projectName: 'test',
+      projectPath: '/test/path',
+      tmuxSession: 'session',
+      discordChannels: { claude: 'ch-1' },
+      agents: { claude: true },
+      instances: {
+        claude: {
+          instanceId: 'claude',
+          agentType: 'claude',
+          tmuxWindow: 'test-claude',
+          channelId: 'ch-1',
+          runtimeType: 'tmux',
+        },
+      },
+      createdAt: new Date(),
+      lastActive: new Date(),
+    });
+    stateManager.getProject.mockReturnValue(project);
+
+    await messageCallback('claude', 'hello tmux', 'test', 'ch-1');
+
+    // Should NOT call getSdkRunner for dispatching
+    expect(mockGetSdkRunner).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,8 @@ export interface PendingEntry {
   channelId: string;
   messageId: string;
   startMessageId?: string;
+  hookActive?: boolean;
+  promptPreview?: string;
 }
 
 export class PendingMessageTracker {
@@ -39,23 +41,15 @@ export class PendingMessageTracker {
     // Add reaction to user's message
     await this.messaging.addReactionToMessage(channelId, messageId, '⏳');
 
-    // Send a start message and store its ID for thread replies
-    let startMessageId: string | undefined;
-    if (this.messaging.sendToChannelWithId) {
-      try {
-        startMessageId = await this.messaging.sendToChannelWithId(channelId, '⏳ Processing...');
-      } catch {
-        // Non-fatal: thread replies will be skipped if start message fails
-      }
-    }
-
-    this.pendingMessageByInstance.set(key, { channelId, messageId, startMessageId });
+    // Store pending entry WITHOUT start message — deferred until first activity
+    this.pendingMessageByInstance.set(key, { channelId, messageId });
   }
 
   /**
    * Ensure a pending entry exists for this instance.
    * Used for tmux-initiated prompts that bypass the normal Slack message flow.
-   * Sends "⏳ Processing..." but does not add a reaction (no user message to react to).
+   * Does not add a reaction (no user message to react to).
+   * The start message is created lazily via ensureStartMessage().
    */
   async ensurePending(
     projectName: string,
@@ -75,16 +69,59 @@ export class PendingMessageTracker {
       this.recentlyCompleted.delete(key);
     }
 
-    let startMessageId: string | undefined;
+    // Store pending entry WITHOUT start message — deferred until first activity
+    this.pendingMessageByInstance.set(key, { channelId, messageId: '' });
+  }
+
+  /**
+   * Create the "📝 Prompt" start message for this pending entry.
+   * Called either immediately on user prompt submit or lazily on first activity
+   * for tmux-initiated turns.
+   * Returns the startMessageId if created or already exists.
+   */
+  async ensureStartMessage(
+    projectName: string,
+    agentType: string,
+    instanceId?: string,
+    promptPreview?: string,
+  ): Promise<string | undefined> {
+    const key = this.pendingKey(projectName, instanceId || agentType);
+    const pending = this.pendingMessageByInstance.get(key);
+    if (!pending) return undefined;
+    const instanceLabel = `${projectName}/${agentType}${instanceId ? `#${instanceId}` : ''}`;
+
+    if (typeof promptPreview === 'string' && promptPreview.trim().length > 0) {
+      pending.promptPreview = promptPreview;
+    }
+    const effectivePreview = pending.promptPreview;
+
+    // Already has a start message
+    if (pending.startMessageId) return pending.startMessageId;
+
+    // tmux-initiated turns without known prompt text should not emit
+    // a generic "Prompt (agent)" marker.
+    if (!effectivePreview?.trim() && !pending.messageId) {
+      console.log(`⏭️ [${instanceLabel}] start message skipped (no submitted prompt on source-less turn)`);
+      return undefined;
+    }
+
     if (this.messaging.sendToChannelWithId) {
       try {
-        startMessageId = await this.messaging.sendToChannelWithId(channelId, '⏳ Processing...');
+        pending.startMessageId = await this.messaging.sendToChannelWithId(
+          pending.channelId,
+          this.formatStartMessage(agentType, effectivePreview),
+        );
+        const previewSuffix = effectivePreview?.trim()
+          ? ` preview=(${effectivePreview.length} chars)`
+          : ' preview=(none)';
+        console.log(`📝 [${instanceLabel}] start message sent${previewSuffix}`);
       } catch {
-        // Non-fatal: thread replies will be skipped if start message fails
+        // Non-fatal
+        console.log(`⚠️ [${instanceLabel}] start message send failed`);
       }
     }
 
-    this.pendingMessageByInstance.set(key, { channelId, messageId: '', startMessageId });
+    return pending.startMessageId;
   }
 
   async markCompleted(projectName: string, agentType: string, instanceId?: string): Promise<void> {
@@ -124,5 +161,42 @@ export class PendingMessageTracker {
   getPending(projectName: string, agentType: string, instanceId?: string): PendingEntry | undefined {
     const key = this.pendingKey(projectName, instanceId || agentType);
     return this.pendingMessageByInstance.get(key) || this.recentlyCompleted.get(key)?.entry;
+  }
+
+  setHookActive(projectName: string, agentType: string, instanceId?: string): void {
+    const key = this.pendingKey(projectName, instanceId || agentType);
+    const pending = this.pendingMessageByInstance.get(key);
+    if (pending) {
+      pending.hookActive = true;
+    }
+  }
+
+  isHookActive(projectName: string, agentType: string, instanceId?: string): boolean {
+    const key = this.pendingKey(projectName, instanceId || agentType);
+    const pending = this.pendingMessageByInstance.get(key);
+    return pending?.hookActive === true;
+  }
+
+  setPromptPreview(
+    projectName: string,
+    agentType: string,
+    promptPreview: string,
+    instanceId?: string,
+  ): void {
+    if (promptPreview.trim().length === 0) return;
+    const key = this.pendingKey(projectName, instanceId || agentType);
+    const pending = this.pendingMessageByInstance.get(key);
+    if (!pending) return;
+    pending.promptPreview = promptPreview;
+  }
+
+  private formatStartMessage(agentType: string, promptPreview?: string): string {
+    const preview = promptPreview ?? '';
+    if (preview.trim().length > 0) {
+      return `📝 Prompt: ${preview}`;
+    }
+
+    const agentSuffix = agentType ? ` (${agentType})` : '';
+    return `📝 Prompt${agentSuffix}`;
   }
 }

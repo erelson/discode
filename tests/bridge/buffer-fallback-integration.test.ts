@@ -10,7 +10,7 @@ import { execSync } from 'child_process';
 
 // ── Mocks ───────────────────────────────────────────────────────────
 
-const mockDownloadFileAttachments = vi.fn().mockResolvedValue([]);
+const mockDownloadFileAttachments = vi.fn().mockResolvedValue({ downloaded: [], skipped: [] });
 const mockBuildFileMarkers = vi.fn().mockReturnValue('');
 
 vi.mock('../../src/infra/file-downloader.js', () => ({
@@ -122,6 +122,8 @@ describe('buffer fallback integration (real tmux)', () => {
       runtime,
       stateManager,
       pendingTracker,
+      streamingUpdater: { canStream: vi.fn(), start: vi.fn(), append: vi.fn(),
+      appendCumulative: vi.fn(), finalize: vi.fn(), discard: vi.fn(), has: vi.fn() } as any,
       sanitizeInput: (content: string) => content.trim() || null,
     });
 

@@ -3,6 +3,7 @@
  */
 
 export * from './interfaces.js';
+export * from './hook-contract.js';
 
 export interface DiscordConfig {
   token: string;
@@ -89,6 +90,10 @@ export interface ProjectInstanceState {
   containerId?: string;
   /** Docker container name for display/logging. */
   containerName?: string;
+  /** Runtime type: 'tmux' (default) or 'sdk' (in-process Claude Agent SDK). */
+  runtimeType?: 'tmux' | 'sdk';
+  /** SDK conversation session ID for multi-turn continuation. */
+  sdkSessionId?: string;
 }
 
 export interface ProjectState {
@@ -154,6 +159,8 @@ export const SUPPORTED_FILE_TYPES = [
   'image/jpeg',
   'image/gif',
   'image/webp',
+  'image/svg+xml',
+  'image/bmp',
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',

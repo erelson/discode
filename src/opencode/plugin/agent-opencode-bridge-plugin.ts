@@ -8,20 +8,27 @@ export const AgentDiscordBridgePlugin = async () => {
   /** @type {Map<string, { order: string[]; parts: Record<string, string> }>} */
   const assistantTextByMessage = new Map();
 
-  const projectName = process.env.AGENT_DISCORD_PROJECT || "";
-  const agentType = process.env.AGENT_DISCORD_AGENT || "opencode";
-  const instanceId = process.env.AGENT_DISCORD_INSTANCE || "";
-  const port = process.env.AGENT_DISCORD_PORT || "18470";
-  const hostname = process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
+  const projectName = process.env.DISCODE_PROJECT || process.env.AGENT_DISCORD_PROJECT || "";
+  const agentType = process.env.DISCODE_AGENT || process.env.AGENT_DISCORD_AGENT || "opencode";
+  const instanceId = process.env.DISCODE_INSTANCE || process.env.AGENT_DISCORD_INSTANCE || "";
+  const port = process.env.DISCODE_PORT || process.env.AGENT_DISCORD_PORT || "18470";
+  const hostname = process.env.DISCODE_HOSTNAME || process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
   const endpoint = "http://" + hostname + ":" + port + "/opencode-event";
+
+  const hookToken = process.env.DISCODE_HOOK_TOKEN || "";
 
   /** @param {Record<string, unknown>} payload */
   const post = async (payload) => {
     if (!projectName) return;
+    /** @type {Record<string, string>} */
+    const headers = { "content-type": "application/json" };
+    if (hookToken) {
+      headers["authorization"] = "Bearer " + hookToken;
+    }
     try {
       await fetch(endpoint, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify({
           projectName,
           agentType,

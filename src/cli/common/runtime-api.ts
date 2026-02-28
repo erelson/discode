@@ -1,4 +1,5 @@
 import { request as httpRequest } from 'http';
+import { readHookToken } from '../../policy/agent-launch.js';
 
 export type RuntimeWindowInfo = {
   windowId: string;
@@ -27,18 +28,22 @@ export async function runtimeApiRequest(params: {
 }): Promise<RuntimeApiResponse> {
   return await new Promise((resolve, reject) => {
     const body = params.payload === undefined ? '' : JSON.stringify(params.payload);
+    const hookToken = readHookToken();
+    const headers: Record<string, string> = {};
+    if (hookToken) {
+      headers.Authorization = `Bearer ${hookToken}`;
+    }
+    if (params.method === 'POST') {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = String(Buffer.byteLength(body));
+    }
     const req = httpRequest(
       {
         hostname: '127.0.0.1',
         port: params.port,
         path: params.path,
         method: params.method,
-        headers: params.method === 'POST'
-          ? {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body),
-          }
-          : undefined,
+        headers: Object.keys(headers).length > 0 ? headers : undefined,
       },
       (res) => {
         let data = '';
@@ -59,6 +64,32 @@ export async function runtimeApiRequest(params: {
   });
 }
 
+export function parseRuntimeWindowsResponse(raw: string): RuntimeWindowsResponse | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<RuntimeWindowsResponse>;
+    if (!Array.isArray(parsed.windows)) return null;
+    const windows = parsed.windows
+      .filter((item): item is RuntimeWindowInfo => {
+        if (!item || typeof item !== 'object') return false;
+        const value = item as Record<string, unknown>;
+        return typeof value.windowId === 'string' && typeof value.sessionName === 'string' && typeof value.windowName === 'string';
+      })
+      .map((item) => ({
+        windowId: item.windowId,
+        sessionName: item.sessionName,
+        windowName: item.windowName,
+        status: item.status,
+        pid: item.pid,
+      }));
+    return {
+      activeWindowId: typeof parsed.activeWindowId === 'string' ? parsed.activeWindowId : undefined,
+      windows,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function listRuntimeWindows(port: number): Promise<RuntimeWindowsResponse | null> {
   try {
     const response = await runtimeApiRequest({
@@ -67,20 +98,7 @@ export async function listRuntimeWindows(port: number): Promise<RuntimeWindowsRe
       path: '/runtime/windows',
     });
     if (response.status !== 200) return null;
-    const parsed = JSON.parse(response.body) as Partial<RuntimeWindowsResponse>;
-    if (!Array.isArray(parsed.windows)) return null;
-    const windows = parsed.windows.filter((item): item is RuntimeWindowInfo => {
-      if (!item || typeof item !== 'object') return false;
-      const value = item as Record<string, unknown>;
-      return typeof value.windowId === 'string' && typeof value.sessionName === 'string' && typeof value.windowName === 'string';
-    });
-    return {
-      protocolVersion: Number.isFinite(parsed.protocolVersion)
-        ? Math.floor(parsed.protocolVersion as number)
-        : undefined,
-      activeWindowId: typeof parsed.activeWindowId === 'string' ? parsed.activeWindowId : undefined,
-      windows,
-    };
+    return parseRuntimeWindowsResponse(response.body);
   } catch {
     return null;
   }

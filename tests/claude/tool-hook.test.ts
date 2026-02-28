@@ -13,19 +13,38 @@ import { fileURLToPath } from 'url';
 import { Script, createContext } from 'vm';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
-const hookPath = join(__dir, '../../src/claude/plugin/scripts/discode-tool-hook.js');
+const scriptsDir = join(__dir, '../../src/claude/plugin/scripts');
+const hookPath = join(scriptsDir, 'discode-tool-hook.js');
 
-type FormatToolLineFn = (toolName: string, toolInput: Record<string, unknown>) => string;
+type FormatToolLineFn = (toolName: string, toolInput: Record<string, unknown>, toolResponse?: string) => string;
 type ShortenPathFn = (fp: string, maxSegments: number) => string;
 type FirstLinePreviewFn = (str: string, maxLen: number) => string;
+
+function loadLib(overrides: { process?: any; fetch?: any } = {}) {
+  const realFs = require('fs');
+  const libSrc = readFileSync(join(scriptsDir, 'discode-hook-lib.js'), 'utf-8');
+  const libMod = { exports: {} as any };
+  new Script(libSrc, { filename: 'discode-hook-lib.js' }).runInContext(createContext({
+    require: (m: string) => m === 'fs' ? realFs : {},
+    module: libMod, exports: libMod.exports,
+    process: overrides.process || { env: {} },
+    fetch: overrides.fetch || (async () => ({})),
+    Buffer, Promise, setTimeout, JSON, Array, Object, Math, Number, String, RegExp, parseInt, parseFloat,
+  }));
+  return libMod.exports;
+}
 
 function loadHookFunctions() {
   const raw = readFileSync(hookPath, 'utf-8');
   // Strip the self-executing main() so it doesn't run
   const src = raw.replace(/main\(\)\.catch[\s\S]*$/, '');
 
+  const lib = loadLib();
   const ctx = createContext({
-    require: () => ({}),
+    require: (mod: string) => {
+      if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+      return {};
+    },
     process: { env: {}, stdin: { isTTY: true } },
     console: { error: () => {} },
     Promise,
@@ -38,6 +57,7 @@ function loadHookFunctions() {
     Math,
     Number,
     String,
+    RegExp,
     parseInt,
     parseFloat,
   });
@@ -197,12 +217,71 @@ describe('formatToolLine', () => {
     expect(formatToolLine('Bash', {})).toBe('');
   });
 
-  it('returns empty for non-file tools', () => {
-    expect(formatToolLine('Grep', { pattern: 'foo' })).toBe('');
-    expect(formatToolLine('Glob', { pattern: '*.ts' })).toBe('');
+  it('returns empty for non-trackable tools', () => {
     expect(formatToolLine('AskUserQuestion', { questions: [] })).toBe('');
-    expect(formatToolLine('Task', {})).toBe('');
     expect(formatToolLine('ExitPlanMode', {})).toBe('');
+  });
+
+  it('formats Grep with pattern and path', () => {
+    expect(formatToolLine('Grep', { pattern: 'TODO', path: '/home/user/project/src' }))
+      .toBe('🔎 Grep(`TODO` in user/project/src)');
+  });
+
+  it('formats Grep with default path', () => {
+    expect(formatToolLine('Grep', { pattern: 'error' }))
+      .toBe('🔎 Grep(`error` in .)');
+  });
+
+  it('formats Glob with pattern', () => {
+    expect(formatToolLine('Glob', { pattern: '**/*.test.ts' }))
+      .toBe('📂 Glob(`**/*.test.ts`)');
+  });
+
+  it('formats WebSearch with query', () => {
+    expect(formatToolLine('WebSearch', { query: 'Claude Code hooks API' }))
+      .toBe('🌐 Search(`Claude Code hooks API`)');
+  });
+
+  it('formats WebFetch with URL', () => {
+    expect(formatToolLine('WebFetch', { url: 'https://example.com/docs' }))
+      .toBe('🌐 Fetch(`https://example.com/docs`)');
+  });
+
+  it('formats Task with description and subagent type', () => {
+    expect(formatToolLine('Task', { description: 'Explore hooks', subagent_type: 'Explore' }))
+      .toBe('🤖 Explore(`Explore hooks`)');
+  });
+
+  it('formats TaskCreate with subject', () => {
+    const result = formatToolLine('TaskCreate', { subject: 'Write unit tests' });
+    expect(result).toBe('TASK_CREATE:{"subject":"Write unit tests"}');
+  });
+
+  it('formats TaskUpdate with taskId and status', () => {
+    const result = formatToolLine('TaskUpdate', { taskId: '1', status: 'completed', subject: '' });
+    expect(result).toBe('TASK_UPDATE:{"taskId":"1","status":"completed","subject":""}');
+  });
+
+  it('detects git commit in Bash response', () => {
+    const result = formatToolLine('Bash', { command: 'git commit -m "fix bug"' },
+      '[main abc1234] fix bug\n 3 files changed, 10 insertions(+), 2 deletions(-)');
+    const parsed = JSON.parse(result.slice('GIT_COMMIT:'.length));
+    expect(parsed.hash).toBe('abc1234');
+    expect(parsed.message).toBe('fix bug');
+    expect(parsed.stat).toContain('3 files changed');
+  });
+
+  it('detects git push in Bash response', () => {
+    const result = formatToolLine('Bash', { command: 'git push' },
+      'To https://github.com/user/repo.git\n   abc1234..def5678  main -> main');
+    const parsed = JSON.parse(result.slice('GIT_PUSH:'.length));
+    expect(parsed.toHash).toBe('def5678');
+    expect(parsed.remoteRef).toBe('main');
+  });
+
+  it('falls through to normal Bash format when no git match', () => {
+    expect(formatToolLine('Bash', { command: 'git status' }, 'On branch main'))
+      .toBe('💻 `git status`');
   });
 
   it('handles null/undefined toolInput', () => {
@@ -291,19 +370,29 @@ describe('tool-hook integration', () => {
       let onData: ((chunk: string) => void) | null = null;
       let onEnd: (() => void) | null = null;
 
-      const ctx = createContext({
-        require: () => ({}),
-        process: {
-          env,
-          stdin: {
-            isTTY: false,
-            setEncoding: () => {},
-            on: (event: string, cb: any) => {
-              if (event === 'data') onData = cb;
-              if (event === 'end') onEnd = cb;
-            },
+      const mockProcess = {
+        env,
+        stdin: {
+          isTTY: false,
+          setEncoding: () => {},
+          on: (event: string, cb: any) => {
+            if (event === 'data') onData = cb;
+            if (event === 'end') onEnd = cb;
           },
         },
+      };
+      const mockFetch = async (url: string, opts: any) => {
+        fetchCalls.push({ url, body: JSON.parse(opts.body) });
+        return {};
+      };
+
+      const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+      const ctx = createContext({
+        require: (mod: string) => {
+          if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+          return {};
+        },
+        process: mockProcess,
         console: { error: () => {} },
         Promise,
         setTimeout,
@@ -314,12 +403,10 @@ describe('tool-hook integration', () => {
         String,
         Number,
         Math,
+        RegExp,
         parseInt,
         parseFloat,
-        fetch: async (url: string, opts: any) => {
-          fetchCalls.push({ url, body: JSON.parse(opts.body) });
-          return {};
-        },
+        fetch: mockFetch,
       });
 
       new Script(raw, { filename: 'discode-tool-hook.js' }).runInContext(ctx);
@@ -335,7 +422,7 @@ describe('tool-hook integration', () => {
 
   it('sends tool.activity for Read tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Read', tool_input: { file_path: '/src/index.ts' } },
     );
     expect(calls).toHaveLength(1);
@@ -349,7 +436,7 @@ describe('tool-hook integration', () => {
 
   it('sends tool.activity for Edit tool with line delta', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Edit', tool_input: { file_path: '/src/app.ts', old_string: 'a', new_string: 'a\nb\nc' } },
     );
     expect(calls).toHaveLength(1);
@@ -361,7 +448,7 @@ describe('tool-hook integration', () => {
 
   it('sends tool.activity for Bash tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Bash', tool_input: { command: 'npm test' } },
     );
     expect(calls).toHaveLength(1);
@@ -369,17 +456,18 @@ describe('tool-hook integration', () => {
     expect(body.text).toBe('💻 `npm test`');
   });
 
-  it('does not send for non-file tools', async () => {
+  it('sends tool.activity for Grep tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Grep', tool_input: { pattern: 'foo' } },
     );
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect((calls[0].body as any).text).toBe('🔎 Grep(`foo` in .)');
   });
 
-  it('does not send when AGENT_DISCORD_PROJECT is empty', async () => {
+  it('does not send when DISCODE_PROJECT is empty', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PORT: '18470' },
       { tool_name: 'Read', tool_input: { file_path: '/src/index.ts' } },
     );
     expect(calls).toHaveLength(0);
@@ -387,7 +475,7 @@ describe('tool-hook integration', () => {
 
   it('includes instanceId when provided', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_INSTANCE: 'inst-A', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_INSTANCE: 'inst-A', DISCODE_PORT: '18470' },
       { tool_name: 'Write', tool_input: { file_path: '/src/new.ts', content: 'hello\nworld' } },
     );
     expect(calls).toHaveLength(1);
@@ -398,7 +486,7 @@ describe('tool-hook integration', () => {
 
   it('uses custom hostname from env', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_HOSTNAME: '192.168.1.5', AGENT_DISCORD_PORT: '9999' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_HOSTNAME: '192.168.1.5', DISCODE_PORT: '9999' },
       { tool_name: 'Bash', tool_input: { command: 'ls' } },
     );
     expect(calls).toHaveLength(1);
@@ -407,7 +495,7 @@ describe('tool-hook integration', () => {
 
   it('sends tool.activity for Write tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Write', tool_input: { file_path: '/src/new.ts', content: 'a\nb\nc' } },
     );
     expect(calls).toHaveLength(1);
@@ -418,23 +506,33 @@ describe('tool-hook integration', () => {
 
   it('does not send for AskUserQuestion', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'AskUserQuestion', tool_input: { questions: [] } },
     );
     expect(calls).toHaveLength(0);
   });
 
-  it('does not send for Glob', async () => {
+  it('sends tool.activity for Glob tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Glob', tool_input: { pattern: '*.ts' } },
     );
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect((calls[0].body as any).text).toBe('📂 Glob(`*.ts`)');
   });
 
-  it('does not send for Task', async () => {
+  it('sends TASK_CREATE for TaskCreate tool', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
+      { tool_name: 'TaskCreate', tool_input: { subject: 'Fix bug' } },
+    );
+    expect(calls).toHaveLength(1);
+    expect((calls[0].body as any).text).toBe('TASK_CREATE:{"subject":"Fix bug"}');
+  });
+
+  it('does not send for Task without description', async () => {
+    const { calls } = await runHook(
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Task', tool_input: {} },
     );
     expect(calls).toHaveLength(0);
@@ -448,25 +546,31 @@ describe('tool-hook integration', () => {
       let onData: ((chunk: string) => void) | null = null;
       let onEnd: (() => void) | null = null;
 
-      const ctx = createContext({
-        require: () => ({}),
-        process: {
-          env: { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
-          stdin: {
-            isTTY: false,
-            setEncoding: () => {},
-            on: (event: string, cb: any) => {
-              if (event === 'data') onData = cb;
-              if (event === 'end') onEnd = cb;
-            },
+      const mockProcess = {
+        env: { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
+        stdin: {
+          isTTY: false,
+          setEncoding: () => {},
+          on: (event: string, cb: any) => {
+            if (event === 'data') onData = cb;
+            if (event === 'end') onEnd = cb;
           },
         },
-        console: { error: () => {} },
-        Promise, setTimeout, Buffer, JSON, Array, Object, String, Number, Math, parseInt, parseFloat,
-        fetch: async (url: string, opts: any) => {
-          fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      };
+      const mockFetch = async (url: string, opts: any) => {
+        fetchCalls.push({ url, body: JSON.parse(opts.body) });
+        return {};
+      };
+      const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+      const ctx = createContext({
+        require: (mod: string) => {
+          if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
           return {};
         },
+        process: mockProcess,
+        console: { error: () => {} },
+        Promise, setTimeout, Buffer, JSON, Array, Object, String, Number, Math, RegExp, parseInt, parseFloat,
+        fetch: mockFetch,
       });
 
       new Script(raw, { filename: 'discode-tool-hook.js' }).runInContext(ctx);
@@ -480,7 +584,7 @@ describe('tool-hook integration', () => {
 
   it('handles empty tool_name gracefully', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: '', tool_input: { file_path: '/src/a.ts' } },
     );
     expect(calls).toHaveLength(0);
@@ -488,7 +592,7 @@ describe('tool-hook integration', () => {
 
   it('handles missing tool_input gracefully', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Read' },
     );
     // tool_input defaults to {}, Read needs file_path → empty → skipped
@@ -497,15 +601,15 @@ describe('tool-hook integration', () => {
 
   it('handles non-string tool_name gracefully', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 42, tool_input: { file_path: '/src/a.ts' } },
     );
     expect(calls).toHaveLength(0);
   });
 
-  it('uses default port 18470 when AGENT_DISCORD_PORT not set', async () => {
+  it('uses default port 18470 when DISCODE_PORT not set', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude' },
       { tool_name: 'Read', tool_input: { file_path: '/src/index.ts' } },
     );
     expect(calls).toHaveLength(1);
@@ -514,7 +618,7 @@ describe('tool-hook integration', () => {
 
   it('uses default agentType "claude" when not set', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_PORT: '18470' },
       { tool_name: 'Read', tool_input: { file_path: '/src/index.ts' } },
     );
     expect(calls).toHaveLength(1);
@@ -523,7 +627,7 @@ describe('tool-hook integration', () => {
 
   it('does not include instanceId when not set', async () => {
     const { calls } = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
       { tool_name: 'Read', tool_input: { file_path: '/src/index.ts' } },
     );
     expect(calls).toHaveLength(1);
@@ -538,25 +642,31 @@ describe('tool-hook integration', () => {
       let onData: ((chunk: string) => void) | null = null;
       let onEnd: (() => void) | null = null;
 
-      const ctx = createContext({
-        require: () => ({}),
-        process: {
-          env: { AGENT_DISCORD_PROJECT: 'myproj', AGENT_DISCORD_AGENT: 'claude', AGENT_DISCORD_PORT: '18470' },
-          stdin: {
-            isTTY: false,
-            setEncoding: () => {},
-            on: (event: string, cb: any) => {
-              if (event === 'data') onData = cb;
-              if (event === 'end') onEnd = cb;
-            },
+      const mockProcess = {
+        env: { DISCODE_PROJECT: 'myproj', DISCODE_AGENT: 'claude', DISCODE_PORT: '18470' },
+        stdin: {
+          isTTY: false,
+          setEncoding: () => {},
+          on: (event: string, cb: any) => {
+            if (event === 'data') onData = cb;
+            if (event === 'end') onEnd = cb;
           },
         },
-        console: { error: () => {} },
-        Promise, setTimeout, Buffer, JSON, Array, Object, String, Number, Math, parseInt, parseFloat,
-        fetch: async () => {
-          fetchCallCount++;
-          throw new Error('Connection refused');
+      };
+      const mockFetch = async () => {
+        fetchCallCount++;
+        throw new Error('Connection refused');
+      };
+      const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+      const ctx = createContext({
+        require: (mod: string) => {
+          if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+          return {};
         },
+        process: mockProcess,
+        console: { error: () => {} },
+        Promise, setTimeout, Buffer, JSON, Array, Object, String, Number, Math, RegExp, parseInt, parseFloat,
+        fetch: mockFetch,
       });
 
       new Script(raw, { filename: 'discode-tool-hook.js' }).runInContext(ctx);

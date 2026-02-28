@@ -11,7 +11,22 @@ import { fileURLToPath } from 'url';
 import { Script, createContext } from 'vm';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
-const hookPath = join(__dir, '../../src/claude/plugin/scripts/discode-session-hook.js');
+const scriptsDir = join(__dir, '../../src/claude/plugin/scripts');
+const hookPath = join(scriptsDir, 'discode-session-hook.js');
+
+function loadLib(overrides: { process?: any; fetch?: any } = {}) {
+  const realFs = require('fs');
+  const libSrc = readFileSync(join(scriptsDir, 'discode-hook-lib.js'), 'utf-8');
+  const libMod = { exports: {} as any };
+  new Script(libSrc, { filename: 'discode-hook-lib.js' }).runInContext(createContext({
+    require: (m: string) => m === 'fs' ? realFs : {},
+    module: libMod, exports: libMod.exports,
+    process: overrides.process || { env: {} },
+    fetch: overrides.fetch || (async () => ({})),
+    Buffer, Promise, setTimeout, JSON, Array, Object, String, Number,
+  }));
+  return libMod.exports;
+}
 
 function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ calls: Array<{ url: string; body: unknown }> }> {
   return new Promise((resolve) => {
@@ -22,19 +37,29 @@ function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ cal
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const ctx = createContext({
-      require: () => ({}),
-      process: {
-        env,
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env,
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async (url: string, opts: any) => {
+      fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      return {};
+    };
+
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: (mod: string) => {
+        if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+        return {};
+      },
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -43,10 +68,7 @@ function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ cal
       Object,
       String,
       Number,
-      fetch: async (url: string, opts: any) => {
-        fetchCalls.push({ url, body: JSON.parse(opts.body) });
-        return {};
-      },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-session-hook.js' }).runInContext(ctx);
@@ -65,7 +87,7 @@ describe('discode-session-hook', () => {
   describe('SessionStart', () => {
     it('posts session.start event with source and model', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'myproject', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'myproject', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart', source: 'startup', model: 'claude-sonnet-4-6' },
       );
 
@@ -80,7 +102,7 @@ describe('discode-session-hook', () => {
 
     it('handles resume source', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart', source: 'resume', model: 'claude-opus-4-6' },
       );
 
@@ -91,7 +113,7 @@ describe('discode-session-hook', () => {
 
     it('handles clear source', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart', source: 'clear', model: 'claude-sonnet-4-6' },
       );
 
@@ -101,7 +123,7 @@ describe('discode-session-hook', () => {
 
     it('handles compact source', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart', source: 'compact', model: 'claude-sonnet-4-6' },
       );
 
@@ -111,7 +133,7 @@ describe('discode-session-hook', () => {
 
     it('handles missing model field', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart', source: 'startup' },
       );
 
@@ -121,7 +143,7 @@ describe('discode-session-hook', () => {
 
     it('handles missing source field', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionStart' },
       );
 
@@ -131,7 +153,7 @@ describe('discode-session-hook', () => {
 
     it('includes instanceId when set', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_INSTANCE: 'inst-2' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_INSTANCE: 'inst-2' },
         { hook_event_name: 'SessionStart', source: 'startup', model: 'claude-sonnet-4-6' },
       );
 
@@ -139,9 +161,9 @@ describe('discode-session-hook', () => {
       expect((result.calls[0].body as any).instanceId).toBe('inst-2');
     });
 
-    it('omits instanceId when AGENT_DISCORD_INSTANCE is empty', async () => {
+    it('omits instanceId when DISCODE_INSTANCE is empty', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_INSTANCE: '' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_INSTANCE: '' },
         { hook_event_name: 'SessionStart', source: 'startup' },
       );
 
@@ -153,7 +175,7 @@ describe('discode-session-hook', () => {
   describe('SessionEnd', () => {
     it('posts session.end event with reason', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'myproject', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'myproject', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd', reason: 'logout' },
       );
 
@@ -167,7 +189,7 @@ describe('discode-session-hook', () => {
 
     it('handles prompt_input_exit reason', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd', reason: 'prompt_input_exit' },
       );
 
@@ -177,7 +199,7 @@ describe('discode-session-hook', () => {
 
     it('handles clear reason', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd', reason: 'clear' },
       );
 
@@ -187,7 +209,7 @@ describe('discode-session-hook', () => {
 
     it('handles bypass_permissions_disabled reason', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd', reason: 'bypass_permissions_disabled' },
       );
 
@@ -197,7 +219,7 @@ describe('discode-session-hook', () => {
 
     it('handles other reason', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd', reason: 'other' },
       );
 
@@ -207,7 +229,7 @@ describe('discode-session-hook', () => {
 
     it('handles missing reason field', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         { hook_event_name: 'SessionEnd' },
       );
 
@@ -217,7 +239,7 @@ describe('discode-session-hook', () => {
 
     it('includes instanceId when set', async () => {
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_INSTANCE: 'inst-3' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_INSTANCE: 'inst-3' },
         { hook_event_name: 'SessionEnd', reason: 'logout' },
       );
 
@@ -226,9 +248,9 @@ describe('discode-session-hook', () => {
     });
   });
 
-  it('does nothing when AGENT_DISCORD_PROJECT is not set', async () => {
+  it('does nothing when DISCODE_PROJECT is not set', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PORT: '18470' },
       { hook_event_name: 'SessionStart', source: 'startup' },
     );
 
@@ -237,7 +259,7 @@ describe('discode-session-hook', () => {
 
   it('does nothing for unknown hook_event_name', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { hook_event_name: 'UnknownEvent' },
     );
 
@@ -246,16 +268,16 @@ describe('discode-session-hook', () => {
 
   it('does nothing for missing hook_event_name', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { source: 'startup' },
     );
 
     expect(result.calls).toHaveLength(0);
   });
 
-  it('uses custom AGENT_DISCORD_AGENT', async () => {
+  it('uses custom DISCODE_AGENT', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_AGENT: 'codex' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_AGENT: 'codex' },
       { hook_event_name: 'SessionStart', source: 'startup' },
     );
 
@@ -263,9 +285,9 @@ describe('discode-session-hook', () => {
     expect((result.calls[0].body as any).agentType).toBe('codex');
   });
 
-  it('uses custom AGENT_DISCORD_HOSTNAME in fetch URL', async () => {
+  it('uses custom DISCODE_HOSTNAME in fetch URL', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '9999', AGENT_DISCORD_HOSTNAME: '10.0.0.1' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '9999', DISCODE_HOSTNAME: '10.0.0.1' },
       { hook_event_name: 'SessionEnd', reason: 'logout' },
     );
 
@@ -279,19 +301,28 @@ describe('discode-session-hook', () => {
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const ctx = createContext({
-      require: () => ({}),
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async (url: string, opts: any) => {
+      fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      return {};
+    };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: (mod: string) => {
+        if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+        return {};
+      },
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -300,10 +331,7 @@ describe('discode-session-hook', () => {
       Object,
       String,
       Number,
-      fetch: async (url: string, opts: any) => {
-        fetchCalls.push({ url, body: JSON.parse(opts.body) });
-        return {};
-      },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-session-hook.js' }).runInContext(ctx);
@@ -320,9 +348,9 @@ describe('discode-session-hook', () => {
     expect(fetchCalls).toHaveLength(0);
   });
 
-  it('does nothing when AGENT_DISCORD_PROJECT is not set (SessionEnd)', async () => {
+  it('does nothing when DISCODE_PROJECT is not set (SessionEnd)', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PORT: '18470' },
       { hook_event_name: 'SessionEnd', reason: 'logout' },
     );
 
@@ -335,19 +363,25 @@ describe('discode-session-hook', () => {
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const ctx = createContext({
-      require: () => ({}),
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async () => { throw new Error('network error'); };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: (mod: string) => {
+        if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+        return {};
+      },
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -356,7 +390,7 @@ describe('discode-session-hook', () => {
       Object,
       String,
       Number,
-      fetch: async () => { throw new Error('network error'); },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-session-hook.js' }).runInContext(ctx);
@@ -378,19 +412,25 @@ describe('discode-session-hook', () => {
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const ctx = createContext({
-      require: () => ({}),
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async () => { throw new Error('network error'); };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: (mod: string) => {
+        if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+        return {};
+      },
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -399,7 +439,7 @@ describe('discode-session-hook', () => {
       Object,
       String,
       Number,
-      fetch: async () => { throw new Error('network error'); },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-session-hook.js' }).runInContext(ctx);

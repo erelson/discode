@@ -1,34 +1,27 @@
-import { createServer, type Server, type Socket } from 'net';
+import { createServer, type Server } from 'net';
 import { existsSync, mkdirSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import type { AgentRuntime } from './interface.js';
-import type { TerminalStyledLine } from './vt-screen.js';
-import { renderTerminalSnapshot } from '../capture/parser.js';
 import { incRuntimeMetric } from './vt-diagnostics.js';
-import { RUNTIME_STREAM_PROTOCOL_VERSION } from './protocol.js';
+import {
+  clampNumber,
+  decodeBase64,
+  type RuntimeStreamClientState,
+} from './stream-utilities.js';
+import { flushClientFrame, type FrameRendererOptions } from './stream-frame-renderer.js';
 import { createRuntimeWindowApi, type RuntimeWindowApi } from './window-api.js';
 import { parseRuntimeWindowId } from './window-id.js';
+import { RUNTIME_STREAM_PROTOCOL_VERSION } from './protocol.js';
 
-type RuntimeStreamClientState = {
-  socket: Socket;
-  buffer: string;
-  windowId?: string;
-  cols: number;
-  rows: number;
-  seq: number;
-  lastBufferLength: number;
-  lastSnapshot: string;
-  lastLines: string[];
-  lastEmitAt: number;
-  windowMissingNotified: boolean;
-  runtimeErrorNotified: boolean;
-  lastStyledSignature: string;
-  lastStyledLines: TerminalStyledLine[];
-  lastCursorRow: number;
-  lastCursorCol: number;
-  lastCursorVisible: boolean;
-};
+function parseProtocolVersion(v: unknown): number | undefined {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string') {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
 
 type RuntimeStreamServerOptions = {
   tickMs?: number;
@@ -48,22 +41,24 @@ export class RuntimeStreamServer {
   private server?: Server;
   private clients = new Set<RuntimeStreamClientState>();
   private pollTimer?: NodeJS.Timeout;
+  private runtime: AgentRuntime;
   private runtimeApi: RuntimeWindowApi;
   private tickMs: number;
-  private minEmitIntervalMs: number;
-  private enablePatchDiff: boolean;
-  private patchThresholdRatio: number;
+  private frameOptions: FrameRendererOptions;
 
   constructor(
     runtime: AgentRuntime,
     private socketPath: string = getDefaultRuntimeSocketPath(),
     options?: RuntimeStreamServerOptions,
   ) {
+    this.runtime = runtime;
     this.runtimeApi = createRuntimeWindowApi(runtime);
     this.tickMs = clampNumber(options?.tickMs, 16, 200, 33);
-    this.minEmitIntervalMs = clampNumber(options?.minEmitIntervalMs, 16, 250, 50);
-    this.enablePatchDiff = options?.enablePatchDiff ?? process.env.DISCODE_STREAM_PATCH_DIFF === '1';
-    this.patchThresholdRatio = Math.max(0.05, Math.min(0.95, options?.patchThresholdRatio ?? 0.55));
+    this.frameOptions = {
+      minEmitIntervalMs: clampNumber(options?.minEmitIntervalMs, 16, 250, 50),
+      enablePatchDiff: options?.enablePatchDiff ?? process.env.DISCODE_STREAM_PATCH_DIFF === '1',
+      patchThresholdRatio: Math.max(0.05, Math.min(0.95, options?.patchThresholdRatio ?? 0.55)),
+    };
   }
 
   start(): void {
@@ -186,17 +181,8 @@ export class RuntimeStreamServer {
         client.windowId = message.windowId;
         client.cols = clampNumber(message.cols, 30, 240, 120);
         client.rows = clampNumber(message.rows, 10, 120, 40);
-        client.lastBufferLength = -1;
-        client.lastSnapshot = '';
-        client.lastLines = [];
-        client.windowMissingNotified = false;
-        client.runtimeErrorNotified = false;
-        client.lastStyledSignature = '';
-        client.lastStyledLines = [];
-        client.lastCursorRow = -1;
-        client.lastCursorCol = -1;
-        client.lastCursorVisible = true;
-        this.flushClientFrame(client, true);
+        this.resetClientState(client);
+        flushClientFrame(client, this.runtime, this.frameOptions, this.send.bind(this), true);
         return;
       }
       case 'focus': {
@@ -205,18 +191,9 @@ export class RuntimeStreamServer {
           return;
         }
         client.windowId = message.windowId;
-        client.lastBufferLength = -1;
-        client.lastSnapshot = '';
-        client.lastLines = [];
-        client.windowMissingNotified = false;
-        client.runtimeErrorNotified = false;
-        client.lastStyledSignature = '';
-        client.lastStyledLines = [];
-        client.lastCursorRow = -1;
-        client.lastCursorCol = -1;
-        client.lastCursorVisible = true;
+        this.resetClientState(client);
         this.send(client, { type: 'focus', ok: true, windowId: message.windowId });
-        this.flushClientFrame(client, true);
+        flushClientFrame(client, this.runtime, this.frameOptions, this.send.bind(this), true);
         return;
       }
       case 'input': {
@@ -267,16 +244,8 @@ export class RuntimeStreamServer {
             // best effort; client-side view still updates with requested size
           }
         }
-        client.lastSnapshot = '';
-        client.lastLines = [];
-        client.windowMissingNotified = false;
-        client.runtimeErrorNotified = false;
-        client.lastStyledSignature = '';
-        client.lastStyledLines = [];
-        client.lastCursorRow = -1;
-        client.lastCursorCol = -1;
-        client.lastCursorVisible = true;
-        this.flushClientFrame(client, true);
+        this.resetClientState(client);
+        flushClientFrame(client, this.runtime, this.frameOptions, this.send.bind(this), true);
         return;
       }
       default:
@@ -285,167 +254,23 @@ export class RuntimeStreamServer {
   }
 
   private flushFrames(): void {
+    const sendBound = this.send.bind(this);
     for (const client of this.clients) {
-      this.flushClientFrame(client, false);
+      flushClientFrame(client, this.runtime, this.frameOptions, sendBound, false);
     }
   }
 
-  private flushClientFrame(client: RuntimeStreamClientState, force: boolean = false): void {
-    if (!client.windowId) return;
-    if (force) {
-      incRuntimeMetric('stream_forced_flush');
-    }
-
-    const parsed = parseRuntimeWindowId(client.windowId);
-    if (!parsed) return;
-    if (!this.runtimeApi.exists(parsed)) {
-      if (!client.windowMissingNotified) {
-        this.send(client, {
-          type: 'window-exit',
-          windowId: client.windowId,
-          code: null,
-          signal: 'missing',
-        });
-        client.windowMissingNotified = true;
-      }
-      return;
-    }
+  private resetClientState(client: RuntimeStreamClientState): void {
+    client.lastBufferLength = -1;
+    client.lastSnapshot = '';
+    client.lastLines = [];
     client.windowMissingNotified = false;
-
-    let raw = '';
-    try {
-      raw = this.runtimeApi.getBuffer(parsed);
-      client.runtimeErrorNotified = false;
-    } catch (error) {
-      if (!client.runtimeErrorNotified) {
-        this.send(client, {
-          type: 'error',
-          code: 'runtime_error',
-          message: `Failed to read runtime buffer: ${error instanceof Error ? error.message : String(error)}`,
-        });
-        incRuntimeMetric('stream_runtime_error');
-        client.runtimeErrorNotified = true;
-      }
-      return;
-    }
-
-    const now = Date.now();
-    // Coalesce bursts to reduce CPU/load and improve input responsiveness.
-    if (
-      !force &&
-      client.lastBufferLength >= 0 &&
-      now - client.lastEmitAt < this.minEmitIntervalMs &&
-      raw.length === client.lastBufferLength
-    ) {
-      incRuntimeMetric('stream_coalesced_skip');
-      return;
-    }
-
-    let styledFrame: ReturnType<NonNullable<AgentRuntime['getWindowFrame']>> | undefined | null =
-      null;
-    try {
-      styledFrame = this.runtimeApi.getFrame(parsed, client.cols, client.rows);
-    } catch {
-      styledFrame = null;
-    }
-    if (styledFrame) {
-      const styledLines = cloneStyledLines(styledFrame.lines);
-      const signature = buildStyledSignature(styledLines);
-      const cursorChanged =
-        styledFrame.cursorRow !== client.lastCursorRow ||
-        styledFrame.cursorCol !== client.lastCursorCol;
-      const cursorVisible = styledFrame.cursorVisible !== false;
-      const cursorVisibilityChanged = cursorVisible !== client.lastCursorVisible;
-      if (signature !== client.lastStyledSignature || cursorChanged || cursorVisibilityChanged) {
-        client.lastStyledSignature = signature;
-        client.lastBufferLength = raw.length;
-        client.lastEmitAt = now;
-        client.seq += 1;
-
-        const patch = this.enablePatchDiff
-          ? buildStyledPatch(client.lastStyledLines, styledLines)
-          : null;
-        const usePatch = !!(
-          this.enablePatchDiff
-          && client.lastStyledLines.length > 0
-          && patch
-          && patch.ops.length > 0
-          && patch.ops.length <= Math.ceil(styledLines.length * this.patchThresholdRatio)
-        );
-
-        if (usePatch && patch) {
-          this.send(client, {
-            type: 'patch-styled',
-            windowId: client.windowId,
-            seq: client.seq,
-            lineCount: styledLines.length,
-            ops: patch.ops,
-            cursorRow: styledFrame.cursorRow,
-            cursorCol: styledFrame.cursorCol,
-            cursorVisible,
-          });
-        } else {
-          this.send(client, {
-            type: 'frame-styled',
-            windowId: client.windowId,
-            seq: client.seq,
-            lines: styledLines,
-            cursorRow: styledFrame.cursorRow,
-            cursorCol: styledFrame.cursorCol,
-            cursorVisible,
-          });
-        }
-
-        client.lastStyledLines = styledLines;
-        client.lastCursorRow = styledFrame.cursorRow;
-        client.lastCursorCol = styledFrame.cursorCol;
-        client.lastCursorVisible = cursorVisible;
-      }
-      return;
-    }
-
-    const snapshot = renderTerminalSnapshot(raw, {
-      width: client.cols,
-      height: client.rows,
-    });
-
-    if (snapshot === client.lastSnapshot && raw.length >= 0) {
-      client.lastBufferLength = raw.length;
-      return;
-    }
-
-    client.lastBufferLength = raw.length;
-    const lines = snapshot.split('\n');
-    client.lastSnapshot = snapshot;
-    client.seq += 1;
-    client.lastEmitAt = now;
-
-    const patch = this.enablePatchDiff ? buildLinePatch(client.lastLines, lines) : null;
-    const usePatch = !!(
-      this.enablePatchDiff
-      && client.lastLines.length > 0
-      && patch
-      && patch.ops.length > 0
-      && patch.ops.length <= Math.ceil(lines.length * this.patchThresholdRatio)
-    );
-
-    if (usePatch && patch) {
-      this.send(client, {
-        type: 'patch',
-        windowId: client.windowId,
-        seq: client.seq,
-        lineCount: lines.length,
-        ops: patch.ops,
-      });
-    } else {
-      this.send(client, {
-        type: 'frame',
-        windowId: client.windowId,
-        seq: client.seq,
-        lines,
-      });
-    }
-    client.lastLines = lines;
+    client.runtimeErrorNotified = false;
+    client.lastStyledSignature = '';
+    client.lastStyledLines = [];
+    client.lastCursorRow = -1;
+    client.lastCursorCol = -1;
+    client.lastCursorVisible = true;
   }
 
   private send(client: RuntimeStreamClientState, payload: unknown): void {
@@ -483,80 +308,4 @@ export function getDefaultRuntimeSocketPath(): string {
     return '\\\\.\\pipe\\discode-runtime';
   }
   return join(homedir(), '.discode', 'runtime.sock');
-}
-
-function clampNumber(value: number | undefined, min: number, max: number, fallback: number): number {
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(value!)));
-}
-
-function decodeBase64(value: string): Buffer | null {
-  if (!value || typeof value !== 'string') return null;
-  try {
-    return Buffer.from(value, 'base64');
-  } catch {
-    return null;
-  }
-}
-
-function buildStyledSignature(lines: TerminalStyledLine[]): string {
-  return lines
-    .map((line) => line.segments.map((seg) => `${seg.text}\u001f${seg.fg || ''}\u001f${seg.bg || ''}\u001f${seg.bold ? '1' : '0'}\u001f${seg.italic ? '1' : '0'}\u001f${seg.underline ? '1' : '0'}`).join('\u001e'))
-    .join('\u001d');
-}
-
-function buildLinePatch(prev: string[], next: string[]): { ops: Array<{ index: number; line: string }> } | null {
-  const max = Math.max(prev.length, next.length);
-  const ops: Array<{ index: number; line: string }> = [];
-  for (let i = 0; i < max; i += 1) {
-    const before = prev[i] || '';
-    const after = next[i] || '';
-    if (before !== after) {
-      ops.push({ index: i, line: after });
-    }
-  }
-  if (ops.length === 0 && prev.length === next.length) return null;
-  return { ops };
-}
-
-function buildStyledPatch(prev: TerminalStyledLine[], next: TerminalStyledLine[]): { ops: Array<{ index: number; line: TerminalStyledLine }> } | null {
-  const max = Math.max(prev.length, next.length);
-  const ops: Array<{ index: number; line: TerminalStyledLine }> = [];
-  for (let i = 0; i < max; i += 1) {
-    const before = prev[i] || { segments: [] };
-    const after = next[i] || { segments: [] };
-    if (buildStyledSignature([before]) !== buildStyledSignature([after])) {
-      ops.push({ index: i, line: cloneStyledLine(after) });
-    }
-  }
-  if (ops.length === 0 && prev.length === next.length) return null;
-  return { ops };
-}
-
-function cloneStyledLines(lines: TerminalStyledLine[]): TerminalStyledLine[] {
-  return lines.map(cloneStyledLine);
-}
-
-function cloneStyledLine(line: TerminalStyledLine): TerminalStyledLine {
-  return {
-    segments: line.segments.map((seg) => ({
-      text: seg.text,
-      fg: seg.fg,
-      bg: seg.bg,
-      bold: seg.bold,
-      italic: seg.italic,
-      underline: seg.underline,
-    })),
-  };
-}
-
-function parseProtocolVersion(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return Math.floor(value);
-  }
-  if (typeof value === 'string' && value.trim().length > 0) {
-    const parsed = Number.parseInt(value, 10);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return undefined;
 }

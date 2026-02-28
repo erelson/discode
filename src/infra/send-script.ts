@@ -37,8 +37,8 @@ var http = require("http");
 // Pre-configured by discode — just run this script, no setup needed.
 var project  = ${JSON.stringify(config.projectName)};
 var port     = ${config.port};
-var agent    = process.env.AGENT_DISCORD_AGENT || "";
-var instance = process.env.AGENT_DISCORD_INSTANCE || "";
+var agent    = process.env.DISCODE_AGENT || process.env.AGENT_DISCORD_AGENT || "";
+var instance = process.env.DISCODE_INSTANCE || process.env.AGENT_DISCORD_INSTANCE || "";
 
 var files = process.argv.slice(2);
 if (files.length === 0) {
@@ -55,7 +55,16 @@ var payload = JSON.stringify({
   files: resolved,
 });
 
-var hostname = process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
+var hostname = process.env.DISCODE_HOSTNAME || process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
+var hookToken = process.env.DISCODE_HOOK_TOKEN || "";
+
+var headers = {
+  "Content-Type": "application/json",
+  "Content-Length": Buffer.byteLength(payload),
+};
+if (hookToken) {
+  headers["Authorization"] = "Bearer " + hookToken;
+}
 
 var req = http.request(
   {
@@ -63,10 +72,7 @@ var req = http.request(
     port: port,
     path: "/send-files",
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(payload),
-    },
+    headers: headers,
   },
   function (res) {
     var body = "";

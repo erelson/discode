@@ -5,6 +5,7 @@
  * Sends a per-tool thread reply to Slack/Discord so the user
  * can see progress in real time instead of a single batch summary.
  */
+var { readStdin, postToBridge } = require("./discode-hook-lib.js");
 
 function shortenPath(fp, maxSegments) {
   var parts = fp.split("/").filter(function (p) { return p.length > 0; });
@@ -19,8 +20,9 @@ function firstLinePreview(str, maxLen) {
   return first;
 }
 
-function formatToolLine(toolName, toolInput) {
+function formatToolLine(toolName, toolInput, toolResponse) {
   var input = toolInput && typeof toolInput === "object" ? toolInput : {};
+  var response = typeof toolResponse === "string" ? toolResponse : "";
 
   if (toolName === "Read") {
     var fp = typeof input.file_path === "string" ? input.file_path : "";
@@ -60,42 +62,87 @@ function formatToolLine(toolName, toolInput) {
   if (toolName === "Bash") {
     var cmd = typeof input.command === "string" ? input.command : "";
     if (!cmd) return "";
+
+    // git commit detection
+    if (/\bgit\s+commit\b/.test(cmd) && response) {
+      var commitMatch = response.match(/\[[\w/.-]+\s+([a-f0-9]+)\]\s+(.+)/);
+      if (commitMatch) {
+        var statMatch = response.match(/(\d+)\s+files?\s+changed(?:,\s+(\d+)\s+insertions?[^,]*)?(?:,\s+(\d+)\s+deletions?)?/);
+        return "GIT_COMMIT:" + JSON.stringify({
+          hash: commitMatch[1],
+          message: commitMatch[2],
+          stat: statMatch ? statMatch[0] : "",
+        });
+      }
+    }
+
+    // git push detection
+    if (/\bgit\s+push\b/.test(cmd) && response) {
+      var pushMatch = response.match(/([a-f0-9]+)\.\.([a-f0-9]+)\s+(\S+)\s+->\s+(\S+)/);
+      if (pushMatch) {
+        return "GIT_PUSH:" + JSON.stringify({
+          toHash: pushMatch[2],
+          remoteRef: pushMatch[4],
+        });
+      }
+    }
+
     var truncated = cmd.length > 100 ? cmd.substring(0, 100) + "..." : cmd;
     return "\uD83D\uDCBB `" + truncated + "`";
   }
 
-  // Skip all other tools (Grep, Glob, Task, AskUserQuestion, etc.)
+  if (toolName === "Grep") {
+    var pattern = typeof input.pattern === "string" ? input.pattern : "";
+    if (!pattern) return "";
+    var grepPath = typeof input.path === "string" ? shortenPath(input.path, 3) : ".";
+    return "\uD83D\uDD0E Grep(`" + pattern + "` in " + grepPath + ")";
+  }
+
+  if (toolName === "Glob") {
+    var globPattern = typeof input.pattern === "string" ? input.pattern : "";
+    if (!globPattern) return "";
+    return "\uD83D\uDCC2 Glob(`" + globPattern + "`)";
+  }
+
+  if (toolName === "WebSearch") {
+    var query = typeof input.query === "string" ? input.query : "";
+    if (!query) return "";
+    var truncQuery = query.length > 80 ? query.substring(0, 80) + "..." : query;
+    return "\uD83C\uDF10 Search(`" + truncQuery + "`)";
+  }
+
+  if (toolName === "WebFetch") {
+    var url = typeof input.url === "string" ? input.url : "";
+    if (!url) return "";
+    var truncUrl = url.length > 80 ? url.substring(0, 80) + "..." : url;
+    return "\uD83C\uDF10 Fetch(`" + truncUrl + "`)";
+  }
+
+  if (toolName === "Task") {
+    var desc = typeof input.description === "string" ? input.description : "";
+    var subType = typeof input.subagent_type === "string" ? input.subagent_type : "";
+    if (!desc) return "";
+    return "\uD83E\uDD16 " + subType + "(`" + desc + "`)";
+  }
+
+  if (toolName === "TaskCreate") {
+    var subject = typeof input.subject === "string" ? input.subject : "";
+    if (!subject) return "";
+    return "TASK_CREATE:" + JSON.stringify({ subject: subject });
+  }
+
+  if (toolName === "TaskUpdate") {
+    var taskId = typeof input.taskId === "string" ? input.taskId : "";
+    var status = typeof input.status === "string" ? input.status : "";
+    if (!taskId) return "";
+    return "TASK_UPDATE:" + JSON.stringify({
+      taskId: taskId,
+      status: status,
+      subject: typeof input.subject === "string" ? input.subject : "",
+    });
+  }
+
   return "";
-}
-
-function readStdin() {
-  return new Promise(function (resolve) {
-    if (process.stdin.isTTY) {
-      resolve("");
-      return;
-    }
-
-    var raw = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", function (chunk) {
-      raw += chunk;
-    });
-    process.stdin.on("end", function () {
-      resolve(raw);
-    });
-    process.stdin.on("error", function () {
-      resolve("");
-    });
-  });
-}
-
-async function postToBridge(port, payload) {
-  var hostname = process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
-  await fetch("http://" + hostname + ":" + port + "/opencode-event", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
 }
 
 async function main() {
@@ -107,17 +154,45 @@ async function main() {
     input = {};
   }
 
-  var projectName = process.env.AGENT_DISCORD_PROJECT || "";
+  var projectName = process.env.DISCODE_PROJECT || process.env.AGENT_DISCORD_PROJECT || "";
   if (!projectName) return;
 
-  var agentType = process.env.AGENT_DISCORD_AGENT || "claude";
-  var instanceId = process.env.AGENT_DISCORD_INSTANCE || "";
-  var port = process.env.AGENT_DISCORD_PORT || "18470";
+  var agentType = process.env.DISCODE_AGENT || process.env.AGENT_DISCORD_AGENT || "claude";
+  var instanceId = process.env.DISCODE_INSTANCE || process.env.AGENT_DISCORD_INSTANCE || "";
+  var port = process.env.DISCODE_PORT || process.env.AGENT_DISCORD_PORT || "18470";
 
+  var hookEventName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+
+  // PostToolUseFailure — report tool failure to bridge
+  if (hookEventName === "PostToolUseFailure") {
+    var failToolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    var errorMsg = typeof input.error === "string" ? input.error : "";
+    if (!failToolName) return;
+    var errorPreview = errorMsg.length > 150 ? errorMsg.substring(0, 150) + "..." : errorMsg;
+
+    console.error("[discode-tool-hook] project=" + projectName + " event=tool.failure tool=" + failToolName);
+
+    try {
+      await postToBridge(port, {
+        projectName: projectName,
+        agentType: agentType,
+        ...(instanceId ? { instanceId: instanceId } : {}),
+        type: "tool.failure",
+        toolName: failToolName,
+        error: errorPreview,
+      });
+    } catch (_) {
+      // ignore bridge delivery failures
+    }
+    return;
+  }
+
+  // PostToolUse — existing tool activity reporting
   var toolName = typeof input.tool_name === "string" ? input.tool_name : "";
   var toolInput = input.tool_input && typeof input.tool_input === "object" ? input.tool_input : {};
+  var toolResponse = typeof input.tool_response === "string" ? input.tool_response : "";
 
-  var line = formatToolLine(toolName, toolInput);
+  var line = formatToolLine(toolName, toolInput, toolResponse);
   if (!line) return;
 
   try {

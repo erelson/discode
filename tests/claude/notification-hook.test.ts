@@ -13,7 +13,31 @@ import { fileURLToPath } from 'url';
 import { Script, createContext } from 'vm';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
-const hookPath = join(__dir, '../../src/claude/plugin/scripts/discode-notification-hook.js');
+const scriptsDir = join(__dir, '../../src/claude/plugin/scripts');
+const hookPath = join(scriptsDir, 'discode-notification-hook.js');
+
+function loadLib(overrides: { process?: any; fetch?: any } = {}) {
+  const realFs = require('fs');
+  const libSrc = readFileSync(join(scriptsDir, 'discode-hook-lib.js'), 'utf-8');
+  const libMod = { exports: {} as any };
+  new Script(libSrc, { filename: 'discode-hook-lib.js' }).runInContext(createContext({
+    require: (m: string) => m === 'fs' ? realFs : {},
+    module: libMod, exports: libMod.exports,
+    process: overrides.process || { env: {} },
+    fetch: overrides.fetch || (async () => ({})),
+    Buffer, Promise, setTimeout, JSON, Array, Object, Math, Number, String, parseInt, parseFloat,
+  }));
+  return libMod.exports;
+}
+
+function makeRequire(lib: any, realFs?: any) {
+  const fs = realFs || require('fs');
+  return (mod: string) => {
+    if (mod === 'fs') return fs;
+    if (mod === './discode-hook-lib.js' || mod === './discode-hook-lib') return lib;
+    return {};
+  };
+}
 
 function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ calls: Array<{ url: string; body: unknown }> }> {
   return new Promise((resolve) => {
@@ -24,23 +48,26 @@ function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ cal
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const realFs = require('fs');
-    const ctx = createContext({
-      require: (mod: string) => {
-        if (mod === 'fs') return realFs;
-        return {};
-      },
-      process: {
-        env,
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env,
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async (url: string, opts: any) => {
+      fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      return {};
+    };
+
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: makeRequire(lib),
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -53,10 +80,7 @@ function runHook(env: Record<string, string>, stdinJson: unknown): Promise<{ cal
       Math,
       parseInt,
       parseFloat,
-      fetch: async (url: string, opts: any) => {
-        fetchCalls.push({ url, body: JSON.parse(opts.body) });
-        return {};
-      },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-notification-hook.js' }).runInContext(ctx);
@@ -79,12 +103,9 @@ function loadHookFunctions() {
   const raw = readFileSync(hookPath, 'utf-8');
   const src = raw.replace(/main\(\)\.catch[\s\S]*$/, '');
 
-  const realFs = require('fs');
+  const lib = loadLib();
   const ctx = createContext({
-    require: (mod: string) => {
-      if (mod === 'fs') return realFs;
-      return {};
-    },
+    require: makeRequire(lib),
     process: { env: {}, stdin: { isTTY: true } },
     console: { error: () => {} },
     Promise,
@@ -113,7 +134,7 @@ const { extractPromptFromTranscript, formatPromptText } = loadHookFunctions();
 describe('discode-notification-hook', () => {
   it('posts session.notification event with permission_prompt type', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'myproject', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'myproject', DISCODE_PORT: '18470' },
       { message: 'Claude needs permission to use Bash', notification_type: 'permission_prompt' },
     );
 
@@ -128,7 +149,7 @@ describe('discode-notification-hook', () => {
 
   it('posts with idle_prompt notification type', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: 'Claude is idle', notification_type: 'idle_prompt' },
     );
 
@@ -138,7 +159,7 @@ describe('discode-notification-hook', () => {
 
   it('posts with auth_success notification type', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: 'Auth succeeded', notification_type: 'auth_success' },
     );
 
@@ -149,7 +170,7 @@ describe('discode-notification-hook', () => {
 
   it('posts with elicitation_dialog notification type', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: 'Claude wants to ask a question', notification_type: 'elicitation_dialog' },
     );
 
@@ -159,7 +180,7 @@ describe('discode-notification-hook', () => {
 
   it('includes instanceId when set', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_INSTANCE: 'inst-1' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_INSTANCE: 'inst-1' },
       { message: 'test', notification_type: 'auth_success' },
     );
 
@@ -167,9 +188,9 @@ describe('discode-notification-hook', () => {
     expect((result.calls[0].body as any).instanceId).toBe('inst-1');
   });
 
-  it('omits instanceId when AGENT_DISCORD_INSTANCE is empty', async () => {
+  it('omits instanceId when DISCODE_INSTANCE is empty', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_INSTANCE: '' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_INSTANCE: '' },
       { message: 'test', notification_type: 'permission_prompt' },
     );
 
@@ -177,9 +198,9 @@ describe('discode-notification-hook', () => {
     expect((result.calls[0].body as any).instanceId).toBeUndefined();
   });
 
-  it('uses custom AGENT_DISCORD_AGENT', async () => {
+  it('uses custom DISCODE_AGENT', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470', AGENT_DISCORD_AGENT: 'gemini' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470', DISCODE_AGENT: 'gemini' },
       { message: 'test', notification_type: 'permission_prompt' },
     );
 
@@ -187,9 +208,9 @@ describe('discode-notification-hook', () => {
     expect((result.calls[0].body as any).agentType).toBe('gemini');
   });
 
-  it('uses custom AGENT_DISCORD_HOSTNAME in fetch URL', async () => {
+  it('uses custom DISCODE_HOSTNAME in fetch URL', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '9999', AGENT_DISCORD_HOSTNAME: '10.0.0.1' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '9999', DISCODE_HOSTNAME: '10.0.0.1' },
       { message: 'test', notification_type: 'permission_prompt' },
     );
 
@@ -197,9 +218,9 @@ describe('discode-notification-hook', () => {
     expect(result.calls[0].url).toBe('http://10.0.0.1:9999/opencode-event');
   });
 
-  it('uses custom AGENT_DISCORD_PORT', async () => {
+  it('uses custom DISCODE_PORT', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '12345' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '12345' },
       { message: 'test', notification_type: 'permission_prompt' },
     );
 
@@ -207,9 +228,9 @@ describe('discode-notification-hook', () => {
     expect(result.calls[0].url).toContain(':12345/');
   });
 
-  it('does nothing when AGENT_DISCORD_PROJECT is not set', async () => {
+  it('does nothing when DISCODE_PROJECT is not set', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PORT: '18470' },
       { message: 'test', notification_type: 'permission_prompt' },
     );
 
@@ -218,7 +239,7 @@ describe('discode-notification-hook', () => {
 
   it('handles missing notification_type gracefully', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: 'some notification' },
     );
 
@@ -228,7 +249,7 @@ describe('discode-notification-hook', () => {
 
   it('handles empty message', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: '', notification_type: 'permission_prompt' },
     );
 
@@ -238,7 +259,7 @@ describe('discode-notification-hook', () => {
 
   it('handles missing message field (undefined)', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { notification_type: 'idle_prompt' },
     );
 
@@ -248,7 +269,7 @@ describe('discode-notification-hook', () => {
 
   it('trims whitespace from message', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: '  some message  ', notification_type: 'permission_prompt' },
     );
 
@@ -264,23 +285,22 @@ describe('discode-notification-hook', () => {
     let onEnd: (() => void) | null = null;
     let errorThrown = false;
 
-    const realFs = require('fs');
-    const ctx = createContext({
-      require: (mod: string) => {
-        if (mod === 'fs') return realFs;
-        return {};
-      },
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async () => { throw new Error('network error'); };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: makeRequire(lib),
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -293,7 +313,7 @@ describe('discode-notification-hook', () => {
       Math,
       parseInt,
       parseFloat,
-      fetch: async () => { throw new Error('network error'); },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-notification-hook.js' }).runInContext(ctx);
@@ -317,20 +337,22 @@ describe('discode-notification-hook', () => {
     const raw = readFileSync(hookPath, 'utf-8');
     const fetchCalls: Array<{ url: string; body: unknown }> = [];
 
-    const realFs = require('fs');
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: true,
+        setEncoding: () => {},
+        on: () => {},
+      },
+    };
+    const mockFetch = async (url: string, opts: any) => {
+      fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      return {};
+    };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
     const ctx = createContext({
-      require: (mod: string) => {
-        if (mod === 'fs') return realFs;
-        return {};
-      },
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: true,
-          setEncoding: () => {},
-          on: () => {},
-        },
-      },
+      require: makeRequire(lib),
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -343,10 +365,7 @@ describe('discode-notification-hook', () => {
       Math,
       parseInt,
       parseFloat,
-      fetch: async (url: string, opts: any) => {
-        fetchCalls.push({ url, body: JSON.parse(opts.body) });
-        return {};
-      },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-notification-hook.js' }).runInContext(ctx);
@@ -367,23 +386,25 @@ describe('discode-notification-hook', () => {
     let onData: ((chunk: string) => void) | null = null;
     let onEnd: (() => void) | null = null;
 
-    const realFs = require('fs');
-    const ctx = createContext({
-      require: (mod: string) => {
-        if (mod === 'fs') return realFs;
-        return {};
-      },
-      process: {
-        env: { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
-        stdin: {
-          isTTY: false,
-          setEncoding: () => {},
-          on: (event: string, cb: any) => {
-            if (event === 'data') onData = cb;
-            if (event === 'end') onEnd = cb;
-          },
+    const mockProcess = {
+      env: { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
+      stdin: {
+        isTTY: false,
+        setEncoding: () => {},
+        on: (event: string, cb: any) => {
+          if (event === 'data') onData = cb;
+          if (event === 'end') onEnd = cb;
         },
       },
+    };
+    const mockFetch = async (url: string, opts: any) => {
+      fetchCalls.push({ url, body: JSON.parse(opts.body) });
+      return {};
+    };
+    const lib = loadLib({ process: mockProcess, fetch: mockFetch });
+    const ctx = createContext({
+      require: makeRequire(lib),
+      process: mockProcess,
       console: { error: () => {} },
       Promise,
       setTimeout,
@@ -396,10 +417,7 @@ describe('discode-notification-hook', () => {
       Math,
       parseInt,
       parseFloat,
-      fetch: async (url: string, opts: any) => {
-        fetchCalls.push({ url, body: JSON.parse(opts.body) });
-        return {};
-      },
+      fetch: mockFetch,
     });
 
     new Script(raw, { filename: 'discode-notification-hook.js' }).runInContext(ctx);
@@ -666,7 +684,7 @@ describe('notification hook with transcript', () => {
       ].join('\n'));
 
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'myproject', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'myproject', DISCODE_PORT: '18470' },
         {
           message: 'Claude Code needs your attention',
           notification_type: 'idle_prompt',
@@ -706,7 +724,7 @@ describe('notification hook with transcript', () => {
       ].join('\n'));
 
       const result = await runHook(
-        { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+        { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
         {
           message: 'Claude is idle',
           notification_type: 'idle_prompt',
@@ -724,7 +742,7 @@ describe('notification hook with transcript', () => {
 
   it('omits promptText when no transcript_path provided', async () => {
     const result = await runHook(
-      { AGENT_DISCORD_PROJECT: 'proj', AGENT_DISCORD_PORT: '18470' },
+      { DISCODE_PROJECT: 'proj', DISCODE_PORT: '18470' },
       { message: 'Notification', notification_type: 'permission_prompt' },
     );
 

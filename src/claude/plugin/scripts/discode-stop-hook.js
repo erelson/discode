@@ -1,12 +1,8 @@
 #!/usr/bin/env node
-const { readFileSync, openSync, readSync, closeSync, statSync } = require("fs");
+var { asObject, parseLineJson, readTail, extractToolUseBlocks, formatPromptText, readStdin, postToBridge } = require("./discode-hook-lib.js");
 
-function asObject(node) {
-  if (!node || typeof node !== "object" || Array.isArray(node)) return null;
-  return node;
-}
-
-function extractTextBlocks(node, depth = 0) {
+function extractTextBlocks(node, depth) {
+  if (depth === undefined) depth = 0;
   if (depth > 10 || node === undefined || node === null) return [];
 
   if (typeof node === "string") {
@@ -35,60 +31,41 @@ function extractTextBlocks(node, depth = 0) {
   return [];
 }
 
-function extractToolUseBlocks(node, depth = 0) {
-  if (depth > 10 || node === undefined || node === null) return [];
-
-  if (Array.isArray(node)) {
-    return node.flatMap((item) => extractToolUseBlocks(item, depth + 1));
-  }
-
-  const obj = asObject(node);
-  if (!obj) return [];
-
-  if (obj.type === "tool_use" && typeof obj.name === "string") {
-    return [{ name: obj.name, input: obj.input && typeof obj.input === "object" ? obj.input : {} }];
-  }
-
-  if (Array.isArray(obj.content)) {
-    return extractToolUseBlocks(obj.content, depth + 1);
-  }
-
-  return [];
-}
-
-function formatPromptText(toolUseBlocks) {
-  const parts = [];
+function extractPromptQuestions(toolUseBlocks) {
+  const questions = [];
   for (const block of toolUseBlocks) {
-    if (block.name === "AskUserQuestion") {
-      const input = block.input || {};
-      const questions = Array.isArray(input.questions) ? input.questions : [];
-      for (const q of questions) {
-        const qObj = asObject(q);
-        if (!qObj) continue;
-        const header = typeof qObj.header === "string" ? qObj.header : "";
-        const question = typeof qObj.question === "string" ? qObj.question : "";
-        if (!question) continue;
-
-        let text = header ? "\u2753 *" + header + "*\n" + question : "\u2753 " + question;
-        const options = Array.isArray(qObj.options) ? qObj.options : [];
-        for (const opt of options) {
+    if (block.name !== "AskUserQuestion") continue;
+    const input = block.input || {};
+    const qs = Array.isArray(input.questions) ? input.questions : [];
+    for (const q of qs) {
+      const qObj = asObject(q);
+      if (!qObj) continue;
+      const question = typeof qObj.question === "string" ? qObj.question : "";
+      if (!question) continue;
+      const header = typeof qObj.header === "string" ? qObj.header : undefined;
+      const multiSelect = qObj.multiSelect === true;
+      const options = (Array.isArray(qObj.options) ? qObj.options : [])
+        .map(function (opt) {
           const optObj = asObject(opt);
-          if (!optObj) continue;
+          if (!optObj) return null;
           const label = typeof optObj.label === "string" ? optObj.label : "";
-          const desc = typeof optObj.description === "string" ? optObj.description : "";
-          if (!label) continue;
-          text += desc ? "\n\u2022 *" + label + "* \u2014 " + desc : "\n\u2022 *" + label + "*";
-        }
-        parts.push(text);
-      }
-    } else if (block.name === "ExitPlanMode") {
-      parts.push("\uD83D\uDCCB Plan approval needed");
+          if (!label) return null;
+          const description = typeof optObj.description === "string" ? optObj.description : undefined;
+          return description ? { label: label, description: description } : { label: label };
+        })
+        .filter(Boolean);
+      if (options.length === 0) continue;
+      var entry = { question: question, options: options };
+      if (header) entry.header = header;
+      if (multiSelect) entry.multiSelect = true;
+      questions.push(entry);
     }
   }
-  return parts.join("\n\n");
+  return questions;
 }
 
-function extractThinkingBlocks(node, depth = 0) {
+function extractThinkingBlocks(node, depth) {
+  if (depth === undefined) depth = 0;
   if (depth > 10 || node === undefined || node === null) return [];
 
   if (Array.isArray(node)) {
@@ -123,30 +100,27 @@ function readAssistantEntry(entry) {
   return { messageId, text, thinking, toolUse };
 }
 
-function parseLineJson(line) {
-  try {
-    return JSON.parse(line);
-  } catch {
-    return null;
-  }
-}
-
-function readTail(filePath, maxBytes) {
-  try {
-    const st = statSync(filePath);
-    if (st.size === 0) return "";
-    const readSize = Math.min(st.size, maxBytes);
-    const buf = Buffer.alloc(readSize);
-    const fd = openSync(filePath, "r");
-    try {
-      readSync(fd, buf, 0, readSize, st.size - readSize);
-    } finally {
-      closeSync(fd);
-    }
-    return buf.toString("utf8");
-  } catch {
-    return "";
-  }
+/**
+ * Detect system-injected user messages that should NOT be treated as turn boundaries.
+ * These appear mid-turn when Claude Code injects context (Skill definitions,
+ * request interruptions, auto-compact context, etc.).
+ */
+function isSystemInjectedMessage(text) {
+  if (!text) return false;
+  var t = text.trim();
+  // Skill context injection (e.g. "Base directory for this skill: /path/to/skill")
+  if (t.startsWith("Base directory for this skill:")) return true;
+  // Request interruption notice
+  if (t === "[Request interrupted by user]") return true;
+  // System reminder (standalone)
+  if (t.startsWith("<system-reminder>")) return true;
+  // Command output context
+  if (t.startsWith("<command-name>")) return true;
+  // Auto-compact / session continuation context
+  if (t.startsWith("This session is being continued from a previous conversation")) return true;
+  // Local command caveat
+  if (t.startsWith("<local-command-caveat>")) return true;
+  return false;
 }
 
 /**
@@ -155,11 +129,13 @@ function readTail(filePath, maxBytes) {
  * - turnText: all assistant text from the current turn (for file path extraction)
  *
  * The turn boundary is the last real user message (with text content, not tool_result).
+ * System-injected user messages (Skill context, interruptions) are skipped — they appear
+ * mid-turn and should not break the scan.
  * This handles the race condition where the Stop hook fires before the final assistant
  * entry is flushed to disk — earlier entries in the turn may still contain file paths.
  */
 function parseTurnTexts(tail) {
-  if (!tail) return { displayText: "", intermediateText: "", turnText: "", thinking: "", promptText: "" };
+  if (!tail) return { displayText: "", intermediateText: "", turnText: "", thinking: "", promptText: "", promptQuestions: [], planFilePath: "" };
 
   const lines = tail.split("\n");
   let latestMessageId = "";
@@ -186,7 +162,19 @@ function parseTurnTexts(tail) {
         const co = asObject(c);
         return co && co.type === "text";
       });
-      if (hasUserText) break;
+      if (hasUserText) {
+        // Skip system-injected messages (Skill context, interruptions, etc.)
+        // that appear mid-turn — only break at genuine user prompts.
+        // Check each text block individually because Claude Code often wraps
+        // user messages with <system-reminder> tags — if ANY text block is
+        // genuine user input, this is a real turn boundary.
+        const textBlocks = content
+          .filter((c) => { const co = asObject(c); return co && co.type === "text"; })
+          .map((c) => { const co = asObject(c); return co && typeof co.text === "string" ? co.text : ""; });
+        const hasRealUserText = textBlocks.some((t) => t.trim().length > 0 && !isSystemInjectedMessage(t));
+        if (!hasRealUserText) continue;
+        break;
+      }
       // tool_result entries — skip and continue scanning
       continue;
     }
@@ -233,12 +221,26 @@ function parseTurnTexts(tail) {
   allThinkingParts.reverse();
   allToolUseBlocks.reverse();
 
+  // Extract plan file path from ExitPlanMode tool use blocks
+  var planFilePath = "";
+  for (var bi = 0; bi < allToolUseBlocks.length; bi++) {
+    if (allToolUseBlocks[bi].name === "ExitPlanMode") {
+      // Plan file path is typically in system-reminder context — scan all text for it
+      var allText = allTextParts.join("\n") + "\n" + allThinkingParts.join("\n");
+      var planMatch = allText.match(/plan file[^:]*:\s*([^\n]+\.md)/i);
+      if (planMatch) planFilePath = planMatch[1].trim();
+      break;
+    }
+  }
+
   return {
     displayText: latestTextParts.join("\n").trim(),
     intermediateText: intermediateTextParts.join("\n").trim(),
     turnText: allTextParts.join("\n").trim(),
     thinking: allThinkingParts.join("\n").trim(),
     promptText: formatPromptText(allToolUseBlocks),
+    promptQuestions: extractPromptQuestions(allToolUseBlocks),
+    planFilePath: planFilePath,
   };
 }
 
@@ -251,13 +253,13 @@ function sleep(ms) {
  * where the Stop hook fires before the final assistant entry is flushed to disk.
  */
 async function readTurnTexts(transcriptPath) {
-  if (!transcriptPath) return { displayText: "", intermediateText: "", turnText: "", thinking: "", promptText: "" };
+  if (!transcriptPath) return { displayText: "", intermediateText: "", turnText: "", thinking: "", promptText: "", promptQuestions: [], planFilePath: "" };
 
   // Retry up to 3 times with 150ms delay to let the transcript writer flush
   for (let attempt = 0; attempt < 3; attempt += 1) {
     if (attempt > 0) await sleep(150);
 
-    const tail = readTail(transcriptPath, 65536);
+    const tail = readTail(transcriptPath, 131072);
     const result = parseTurnTexts(tail);
 
     // If we found display text, check if the last real entry is an assistant text.
@@ -286,38 +288,8 @@ async function readTurnTexts(transcriptPath) {
   }
 
   // Final attempt without retry check
-  const tail = readTail(transcriptPath, 65536);
+  const tail = readTail(transcriptPath, 131072);
   return parseTurnTexts(tail);
-}
-
-function readStdin() {
-  return new Promise((resolve) => {
-    if (process.stdin.isTTY) {
-      resolve("");
-      return;
-    }
-
-    let raw = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
-      raw += chunk;
-    });
-    process.stdin.on("end", () => {
-      resolve(raw);
-    });
-    process.stdin.on("error", () => {
-      resolve("");
-    });
-  });
-}
-
-async function postToBridge(port, payload) {
-  var hostname = process.env.AGENT_DISCORD_HOSTNAME || "127.0.0.1";
-  await fetch("http://" + hostname + ":" + port + "/opencode-event", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
 }
 
 async function main() {
@@ -329,22 +301,22 @@ async function main() {
     input = {};
   }
 
-  const projectName = process.env.AGENT_DISCORD_PROJECT || "";
+  const projectName = process.env.DISCODE_PROJECT || process.env.AGENT_DISCORD_PROJECT || "";
   if (!projectName) return;
 
-  const agentType = process.env.AGENT_DISCORD_AGENT || "claude";
-  const instanceId = process.env.AGENT_DISCORD_INSTANCE || "";
-  const port = process.env.AGENT_DISCORD_PORT || "18470";
+  const agentType = process.env.DISCODE_AGENT || process.env.AGENT_DISCORD_AGENT || "claude";
+  const instanceId = process.env.DISCODE_INSTANCE || process.env.AGENT_DISCORD_INSTANCE || "";
+  const port = process.env.DISCODE_PORT || process.env.AGENT_DISCORD_PORT || "18470";
   const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
 
-  const { displayText, intermediateText, turnText, thinking, promptText } = await readTurnTexts(transcriptPath);
+  const { displayText, intermediateText, turnText, thinking, promptText, promptQuestions, planFilePath } = await readTurnTexts(transcriptPath);
   let text = displayText;
   if (!text && typeof input.message === "string" && input.message.trim().length > 0) {
     text = input.message;
   }
-  console.error(`[discode-stop-hook] project=${projectName} text_len=${text.length} intermediate_len=${intermediateText.length} turn_text_len=${turnText.length} thinking_len=${thinking.length} prompt_len=${promptText.length}`);
+  console.error(`[discode-stop-hook] project=${projectName} text_len=${text.length} intermediate_len=${intermediateText.length} turn_text_len=${turnText.length} thinking_len=${thinking.length} prompt_len=${promptText.length} questions=${promptQuestions.length}`);
 
-  if (!text && !turnText && !promptText) return;
+  if (!text && !turnText && !promptText && promptQuestions.length === 0) return;
 
   try {
     await postToBridge(port, {
@@ -357,6 +329,8 @@ async function main() {
       ...(intermediateText ? { intermediateText } : {}),
       ...(thinking ? { thinking } : {}),
       ...(promptText ? { promptText } : {}),
+      ...(promptQuestions.length > 0 ? { promptQuestions } : {}),
+      ...(planFilePath ? { planFilePath } : {}),
     });
   } catch {
     // ignore bridge delivery failures

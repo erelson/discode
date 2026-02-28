@@ -1,4 +1,19 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import { escapeShellArg } from '../infra/shell-escape.js';
+
+/**
+ * Read the hook auth token from the well-known state directory.
+ * Returns undefined if the token file does not exist.
+ */
+export function readHookToken(): string | undefined {
+  try {
+    return readFileSync(join(homedir(), '.discode', '.hook-token'), 'utf-8').trim();
+  } catch {
+    return undefined;
+  }
+}
 
 export function buildExportPrefix(env: Record<string, string | undefined>): string {
   const parts: string[] = [];
@@ -9,30 +24,24 @@ export function buildExportPrefix(env: Record<string, string | undefined>): stri
   return parts.length > 0 ? parts.join('; ') + '; ' : '';
 }
 
-export function withClaudePluginDir(command: string, pluginDir?: string): string {
-  if (!pluginDir || pluginDir.length === 0) return command;
-  if (/--plugin-dir\b/.test(command)) return command;
-  const pattern = /((?:^|&&|;)\s*)claude\b/;
-  if (!pattern.test(command)) return command;
-  return command.replace(pattern, `$1claude --plugin-dir ${escapeShellArg(pluginDir)}`);
-}
 
 export function buildAgentLaunchEnv(params: {
   projectName: string;
   port: number;
   agentType: string;
   instanceId: string;
-  permissionAllow: boolean;
   /** Override hostname for container→host communication. */
   hostname?: string;
+  /** Bearer token for hook server authentication. */
+  hookToken?: string;
 }): Record<string, string> {
   return {
-    AGENT_DISCORD_PROJECT: params.projectName,
-    AGENT_DISCORD_PORT: String(params.port),
-    AGENT_DISCORD_AGENT: params.agentType,
-    AGENT_DISCORD_INSTANCE: params.instanceId,
-    ...(params.hostname ? { AGENT_DISCORD_HOSTNAME: params.hostname } : {}),
-    ...(params.permissionAllow ? { OPENCODE_PERMISSION: '{"*":"allow"}' } : {}),
+    DISCODE_PROJECT: params.projectName,
+    DISCODE_PORT: String(params.port),
+    DISCODE_AGENT: params.agentType,
+    DISCODE_INSTANCE: params.instanceId,
+    ...(params.hostname ? { DISCODE_HOSTNAME: params.hostname } : {}),
+    ...(params.hookToken ? { DISCODE_HOOK_TOKEN: params.hookToken } : {}),
   };
 }
 
@@ -47,15 +56,16 @@ export function buildContainerEnv(params: {
   port: number;
   agentType: string;
   instanceId: string;
-  permissionAllow: boolean;
+  /** Bearer token for hook server authentication. */
+  hookToken?: string;
 }): Record<string, string> {
   return {
-    AGENT_DISCORD_PROJECT: params.projectName,
-    AGENT_DISCORD_PORT: String(params.port),
-    AGENT_DISCORD_AGENT: params.agentType,
-    AGENT_DISCORD_INSTANCE: params.instanceId,
+    DISCODE_PROJECT: params.projectName,
+    DISCODE_PORT: String(params.port),
+    DISCODE_AGENT: params.agentType,
+    DISCODE_INSTANCE: params.instanceId,
     // Container→host communication via Docker's built-in DNS
-    AGENT_DISCORD_HOSTNAME: 'host.docker.internal',
-    ...(params.permissionAllow ? { OPENCODE_PERMISSION: '{"*":"allow"}' } : {}),
+    DISCODE_HOSTNAME: 'host.docker.internal',
+    ...(params.hookToken ? { DISCODE_HOOK_TOKEN: params.hookToken } : {}),
   };
 }

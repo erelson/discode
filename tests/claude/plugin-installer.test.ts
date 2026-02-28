@@ -11,6 +11,9 @@ import {
 const CLAUDE_STOP_HOOK_FILENAME = 'discode-stop-hook.js';
 const CLAUDE_NOTIFICATION_HOOK_FILENAME = 'discode-notification-hook.js';
 const CLAUDE_SESSION_HOOK_FILENAME = 'discode-session-hook.js';
+const CLAUDE_PERMISSION_TASK_HOOK_FILENAME = 'discode-permission-task-hook.js';
+const CLAUDE_PROMPT_HOOK_FILENAME = 'discode-prompt-hook.js';
+const CLAUDE_TEAMMATE_HOOK_FILENAME = 'discode-teammate-hook.js';
 
 describe('claude plugin installer', () => {
   let tempDir: string;
@@ -30,6 +33,10 @@ describe('claude plugin installer', () => {
     expect(existsSync(join(sourceDir, 'scripts', CLAUDE_STOP_HOOK_FILENAME))).toBe(true);
     expect(existsSync(join(sourceDir, 'scripts', CLAUDE_NOTIFICATION_HOOK_FILENAME))).toBe(true);
     expect(existsSync(join(sourceDir, 'scripts', CLAUDE_SESSION_HOOK_FILENAME))).toBe(true);
+    expect(existsSync(join(sourceDir, 'scripts', CLAUDE_PERMISSION_TASK_HOOK_FILENAME))).toBe(true);
+    expect(existsSync(join(sourceDir, 'scripts', CLAUDE_PROMPT_HOOK_FILENAME))).toBe(true);
+    expect(existsSync(join(sourceDir, 'scripts', CLAUDE_TEAMMATE_HOOK_FILENAME))).toBe(true);
+    expect(existsSync(join(sourceDir, 'scripts', 'discode-hook-lib.js'))).toBe(true);
   });
 
   it('plugin.json has correct name and no hooks', () => {
@@ -71,19 +78,25 @@ describe('claude plugin installer', () => {
     });
   });
 
+  it('shared hook lib contains bridge delivery logic', () => {
+    const sourceDir = getPluginSourceDir();
+    const libSource = readFileSync(join(sourceDir, 'scripts', 'discode-hook-lib.js'), 'utf-8');
+    expect(libSource).toContain('/opencode-event');
+    expect(libSource).toContain('postToBridge');
+    expect(libSource).toContain('readStdin');
+  });
+
   it('stop hook script contains expected bridge logic', () => {
     const sourceDir = getPluginSourceDir();
     const source = readFileSync(join(sourceDir, 'scripts', CLAUDE_STOP_HOOK_FILENAME), 'utf-8');
-    expect(source).toContain('/opencode-event');
-    expect(source).toContain('process.env.AGENT_DISCORD_AGENT || "claude"');
+    expect(source).toContain('require("./discode-hook-lib.js")');
     expect(source).toContain('type: "session.idle"');
   });
 
   it('notification hook script contains expected bridge logic', () => {
     const sourceDir = getPluginSourceDir();
     const source = readFileSync(join(sourceDir, 'scripts', CLAUDE_NOTIFICATION_HOOK_FILENAME), 'utf-8');
-    expect(source).toContain('/opencode-event');
-    expect(source).toContain('process.env.AGENT_DISCORD_AGENT || "claude"');
+    expect(source).toContain('require("./discode-hook-lib.js")');
     expect(source).toContain('type: "session.notification"');
     expect(source).toContain('notificationType');
     expect(source).toContain('input.notification_type');
@@ -92,8 +105,7 @@ describe('claude plugin installer', () => {
   it('session hook script contains expected bridge logic', () => {
     const sourceDir = getPluginSourceDir();
     const source = readFileSync(join(sourceDir, 'scripts', CLAUDE_SESSION_HOOK_FILENAME), 'utf-8');
-    expect(source).toContain('/opencode-event');
-    expect(source).toContain('process.env.AGENT_DISCORD_AGENT || "claude"');
+    expect(source).toContain('require("./discode-hook-lib.js")');
     expect(source).toContain('type: "session.start"');
     expect(source).toContain('type: "session.end"');
     expect(source).toContain('hook_event_name');

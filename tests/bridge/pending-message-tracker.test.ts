@@ -29,7 +29,8 @@ describe('PendingMessageTracker', () => {
     expect(entry).toBeDefined();
     expect(entry!.channelId).toBe('ch-1');
     expect(entry!.messageId).toBe('msg-1');
-    expect(entry!.startMessageId).toBe('start-msg-123');
+    // startMessageId is not set until ensureStartMessage is called
+    expect(entry!.startMessageId).toBeUndefined();
   });
 
   it('returns undefined for unknown key', () => {
@@ -64,6 +65,7 @@ describe('PendingMessageTracker', () => {
     const tracker = new PendingMessageTracker(messaging as MessagingClient);
 
     await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    await tracker.ensureStartMessage('proj', 'claude');
     await tracker.markCompleted('proj', 'claude');
 
     // hasPending is false (active map is cleared)
@@ -100,6 +102,7 @@ describe('PendingMessageTracker', () => {
     // New pending for the same key should clear the recently-completed entry
     (messaging.sendToChannelWithId as ReturnType<typeof vi.fn>).mockResolvedValue('start-msg-456');
     await tracker.markPending('proj', 'claude', 'ch-2', 'msg-2');
+    await tracker.ensureStartMessage('proj', 'claude');
 
     const entry = tracker.getPending('proj', 'claude');
     expect(entry!.channelId).toBe('ch-2');
@@ -166,18 +169,24 @@ describe('PendingMessageTracker', () => {
     expect(entry).toBeDefined();
     expect(entry!.channelId).toBe('ch-1');
     expect(entry!.messageId).toBe('');
-    expect(entry!.startMessageId).toBe('start-msg-123');
+    // startMessageId is not set until ensureStartMessage is called
+    expect(entry!.startMessageId).toBeUndefined();
   });
 
-  it('ensurePending sends Processing message', async () => {
+  it('ensureStartMessage skips generic start message for tmux pending without preview', async () => {
     const messaging = createMockMessaging();
     const tracker = new PendingMessageTracker(messaging as MessagingClient);
 
     await tracker.ensurePending('proj', 'claude', 'ch-1');
-
-    expect(messaging.sendToChannelWithId).toHaveBeenCalledWith('ch-1', '⏳ Processing...');
+    // ensurePending does NOT send Prompt message
+    expect(messaging.sendToChannelWithId).not.toHaveBeenCalled();
     // Should NOT add reaction (no user message)
     expect(messaging.addReactionToMessage).not.toHaveBeenCalled();
+
+    // ensureStartMessage does not send generic marker when preview is unknown
+    const startId = await tracker.ensureStartMessage('proj', 'claude');
+    expect(startId).toBeUndefined();
+    expect(messaging.sendToChannelWithId).not.toHaveBeenCalled();
   });
 
   it('ensurePending does not duplicate when already pending', async () => {
@@ -189,7 +198,7 @@ describe('PendingMessageTracker', () => {
 
     await tracker.ensurePending('proj', 'claude', 'ch-1');
 
-    // Should not send another Processing message
+    // Should not send another Prompt message
     expect(messaging.sendToChannelWithId).not.toHaveBeenCalled();
     // Original entry preserved
     expect(tracker.getPending('proj', 'claude')!.messageId).toBe('msg-1');
@@ -212,7 +221,12 @@ describe('PendingMessageTracker', () => {
     expect(tracker.hasPending('proj', 'claude')).toBe(true);
     const entry = tracker.getPending('proj', 'claude');
     expect(entry!.messageId).toBe('');
-    expect(entry!.startMessageId).toBe('start-msg-new');
+    // startMessageId is deferred until ensureStartMessage
+    expect(entry!.startMessageId).toBeUndefined();
+
+    tracker.setPromptPreview('proj', 'claude', 'new tmux prompt');
+    await tracker.ensureStartMessage('proj', 'claude');
+    expect(tracker.getPending('proj', 'claude')!.startMessageId).toBe('start-msg-new');
   });
 
   it('ensurePending with instanceId', async () => {
@@ -270,11 +284,79 @@ describe('PendingMessageTracker', () => {
     expect(entry!.startMessageId).toBeUndefined();
   });
 
+  // ── hookActive ──────────────────────────────────────────────────
+
+  it('setHookActive marks pending entry as hook-active', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    expect(tracker.isHookActive('proj', 'claude')).toBe(false);
+
+    tracker.setHookActive('proj', 'claude');
+    expect(tracker.isHookActive('proj', 'claude')).toBe(true);
+  });
+
+  it('isHookActive returns false when no pending entry', () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    expect(tracker.isHookActive('proj', 'claude')).toBe(false);
+  });
+
+  it('setHookActive is no-op when no pending entry', () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    // Should not throw
+    tracker.setHookActive('proj', 'claude');
+    expect(tracker.isHookActive('proj', 'claude')).toBe(false);
+  });
+
+  it('hookActive flag is cleared when markCompleted removes pending entry', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    tracker.setHookActive('proj', 'claude');
+    expect(tracker.isHookActive('proj', 'claude')).toBe(true);
+
+    await tracker.markCompleted('proj', 'claude');
+    // Active map is cleared, so isHookActive should return false
+    expect(tracker.isHookActive('proj', 'claude')).toBe(false);
+  });
+
+  it('hookActive flag is cleared when markPending replaces entry', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    tracker.setHookActive('proj', 'claude');
+
+    // New markPending creates a fresh entry without hookActive
+    await tracker.markPending('proj', 'claude', 'ch-2', 'msg-2');
+    expect(tracker.isHookActive('proj', 'claude')).toBe(false);
+  });
+
+  it('setHookActive with instanceId', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1', 'inst-A');
+    await tracker.markPending('proj', 'claude', 'ch-2', 'msg-2', 'inst-B');
+
+    tracker.setHookActive('proj', 'claude', 'inst-A');
+    expect(tracker.isHookActive('proj', 'claude', 'inst-A')).toBe(true);
+    expect(tracker.isHookActive('proj', 'claude', 'inst-B')).toBe(false);
+  });
+
   it('ensurePending entry stays in recentlyCompleted after markCompleted', async () => {
     const messaging = createMockMessaging();
     const tracker = new PendingMessageTracker(messaging as MessagingClient);
 
     await tracker.ensurePending('proj', 'claude', 'ch-1');
+    tracker.setPromptPreview('proj', 'claude', 'prompt turn1');
+    await tracker.ensureStartMessage('proj', 'claude');
     await tracker.markCompleted('proj', 'claude');
 
     expect(tracker.hasPending('proj', 'claude')).toBe(false);
@@ -289,12 +371,16 @@ describe('PendingMessageTracker', () => {
 
     // Turn 1
     await tracker.ensurePending('proj', 'claude', 'ch-1');
+    tracker.setPromptPreview('proj', 'claude', 'prompt turn1');
+    await tracker.ensureStartMessage('proj', 'claude');
     await tracker.markCompleted('proj', 'claude');
     expect(tracker.hasPending('proj', 'claude')).toBe(false);
 
     // Turn 2 — new ensurePending should work despite recentlyCompleted
     (messaging.sendToChannelWithId as ReturnType<typeof vi.fn>).mockResolvedValue('start-msg-turn2');
     await tracker.ensurePending('proj', 'claude', 'ch-1');
+    tracker.setPromptPreview('proj', 'claude', 'prompt turn2');
+    await tracker.ensureStartMessage('proj', 'claude');
 
     expect(tracker.hasPending('proj', 'claude')).toBe(true);
     const entry = tracker.getPending('proj', 'claude');
@@ -306,6 +392,8 @@ describe('PendingMessageTracker', () => {
     const tracker = new PendingMessageTracker(messaging as MessagingClient);
 
     await tracker.ensurePending('proj', 'claude', 'ch-1');
+    tracker.setPromptPreview('proj', 'claude', 'prompt turn1');
+    await tracker.ensureStartMessage('proj', 'claude');
     await tracker.markCompleted('proj', 'claude');
 
     // recentlyCompleted exists
@@ -314,6 +402,8 @@ describe('PendingMessageTracker', () => {
     // New ensurePending clears old recentlyCompleted timer
     (messaging.sendToChannelWithId as ReturnType<typeof vi.fn>).mockResolvedValue('start-new');
     await tracker.ensurePending('proj', 'claude', 'ch-1');
+    tracker.setPromptPreview('proj', 'claude', 'prompt turn2');
+    await tracker.ensureStartMessage('proj', 'claude');
 
     // Advance past old TTL — should not expire the new active entry
     vi.advanceTimersByTime(31_000);
@@ -325,8 +415,9 @@ describe('PendingMessageTracker', () => {
     const messaging = createMockMessaging();
     const tracker = new PendingMessageTracker(messaging as MessagingClient);
 
-    // 1. User sends message → markPending
+    // 1. User sends message → markPending + ensureStartMessage
     await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    await tracker.ensureStartMessage('proj', 'claude');
     expect(tracker.getPending('proj', 'claude')!.startMessageId).toBe('start-msg-123');
 
     // 2. Buffer fallback fires → markCompleted
@@ -338,5 +429,125 @@ describe('PendingMessageTracker', () => {
     expect(pending).toBeDefined();
     expect(pending!.startMessageId).toBe('start-msg-123');
     expect(pending!.channelId).toBe('ch-1');
+  });
+
+  // ── ensureStartMessage ──────────────────────────────────────────
+
+  it('ensureStartMessage returns undefined when no pending entry', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    const result = await tracker.ensureStartMessage('proj', 'claude');
+    expect(result).toBeUndefined();
+    expect(messaging.sendToChannelWithId).not.toHaveBeenCalled();
+  });
+
+  it('ensureStartMessage creates start message and stores ID', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    const startId = await tracker.ensureStartMessage('proj', 'claude');
+
+    expect(startId).toBe('start-msg-123');
+    expect(messaging.sendToChannelWithId).toHaveBeenCalledWith('ch-1', '📝 Prompt (claude)');
+    expect(tracker.getPending('proj', 'claude')!.startMessageId).toBe('start-msg-123');
+  });
+
+  it('ensureStartMessage includes submitted prompt preview when provided', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    await tracker.ensureStartMessage('proj', 'claude', undefined, '확인메세지');
+
+    expect(messaging.sendToChannelWithId).toHaveBeenCalledWith('ch-1', '📝 Prompt: 확인메세지');
+  });
+
+  it('ensureStartMessage uses stored prompt preview when provided earlier', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    tracker.setPromptPreview('proj', 'claude', 'router prompt text');
+    await tracker.ensureStartMessage('proj', 'claude');
+
+    expect(messaging.sendToChannelWithId).toHaveBeenCalledWith('ch-1', '📝 Prompt: router prompt text');
+  });
+
+  it('ensureStartMessage keeps submitted prompt text as-is', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    await tracker.ensureStartMessage('proj', 'claude', undefined, 'line 1\nline 2');
+
+    expect(messaging.sendToChannelWithId).toHaveBeenCalledWith('ch-1', '📝 Prompt: line 1\nline 2');
+  });
+
+  it('ensureStartMessage is idempotent — returns existing ID on second call', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    const first = await tracker.ensureStartMessage('proj', 'claude');
+    const second = await tracker.ensureStartMessage('proj', 'claude');
+
+    expect(first).toBe('start-msg-123');
+    expect(second).toBe('start-msg-123');
+    // Only one call to sendToChannelWithId
+    expect(messaging.sendToChannelWithId).toHaveBeenCalledTimes(1);
+  });
+
+  it('ensureStartMessage handles sendToChannelWithId not implemented', async () => {
+    const messaging = createMockMessaging();
+    delete (messaging as any).sendToChannelWithId;
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    const result = await tracker.ensureStartMessage('proj', 'claude');
+
+    expect(result).toBeUndefined();
+  });
+
+  it('ensureStartMessage handles sendToChannelWithId failure gracefully', async () => {
+    const messaging = createMockMessaging();
+    (messaging.sendToChannelWithId as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('API error'));
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1');
+    const result = await tracker.ensureStartMessage('proj', 'claude');
+
+    expect(result).toBeUndefined();
+    // Entry still exists, just without startMessageId
+    expect(tracker.hasPending('proj', 'claude')).toBe(true);
+  });
+
+  it('ensureStartMessage skips generic prompt for tmux pending without preview', async () => {
+    const messaging = createMockMessaging();
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.ensurePending('proj', 'codex', 'ch-1');
+    const result = await tracker.ensureStartMessage('proj', 'codex');
+
+    expect(result).toBeUndefined();
+    expect(messaging.sendToChannelWithId).not.toHaveBeenCalled();
+  });
+
+  it('ensureStartMessage uses instanceId for key when provided', async () => {
+    const messaging = createMockMessaging();
+    (messaging.sendToChannelWithId as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce('start-A')
+      .mockResolvedValueOnce('start-B');
+    const tracker = new PendingMessageTracker(messaging as MessagingClient);
+
+    await tracker.markPending('proj', 'claude', 'ch-1', 'msg-1', 'inst-A');
+    await tracker.markPending('proj', 'claude', 'ch-2', 'msg-2', 'inst-B');
+
+    const startA = await tracker.ensureStartMessage('proj', 'claude', 'inst-A');
+    const startB = await tracker.ensureStartMessage('proj', 'claude', 'inst-B');
+
+    expect(startA).toBe('start-A');
+    expect(startB).toBe('start-B');
   });
 });

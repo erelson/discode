@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ── Mocks ───────────────────────────────────────────────────────────
 
-const mockDownloadFileAttachments = vi.fn().mockResolvedValue([]);
+const mockDownloadFileAttachments = vi.fn().mockResolvedValue({ downloaded: [], skipped: [] });
 const mockBuildFileMarkers = vi.fn().mockReturnValue('');
 
 vi.mock('../../src/infra/file-downloader.js', () => ({
@@ -130,8 +130,12 @@ describe('multi-instance platform → agent routing', () => {
     };
     pendingTracker = {
       markPending: vi.fn().mockResolvedValue(undefined),
+      ensurePending: vi.fn().mockResolvedValue(undefined),
+      ensureStartMessage: vi.fn().mockResolvedValue(undefined),
+      setPromptPreview: vi.fn(),
       markError: vi.fn().mockResolvedValue(undefined),
       markCompleted: vi.fn().mockResolvedValue(undefined),
+      getPending: vi.fn().mockReturnValue(undefined),
     };
 
     router = new BridgeMessageRouter({
@@ -139,6 +143,15 @@ describe('multi-instance platform → agent routing', () => {
       runtime,
       stateManager,
       pendingTracker,
+      streamingUpdater: {
+        canStream: vi.fn().mockReturnValue(false),
+        start: vi.fn(),
+        append: vi.fn().mockReturnValue(false),
+        appendCumulative: vi.fn().mockReturnValue(false),
+        finalize: vi.fn().mockResolvedValue(undefined),
+        discard: vi.fn(),
+        has: vi.fn().mockReturnValue(false),
+      } as any,
       sanitizeInput: (content: string) => content.trim() || null,
     });
 
@@ -234,6 +247,11 @@ describe('multi-instance platform → agent routing', () => {
       expect(pendingTracker.markPending).toHaveBeenCalledWith(
         'myapp', 'claude', 'ch-primary', 'msg-10', 'claude',
       );
+      // The router stores the prompt preview for lazy start message creation
+      // (ensureStartMessage is now called by the hook pipeline, not the router)
+      expect(pendingTracker.setPromptPreview).toHaveBeenCalledWith(
+        'myapp', 'claude', 'hello', 'claude',
+      );
     });
 
     it('marks pending with secondary instance key for ch-secondary', async () => {
@@ -243,6 +261,9 @@ describe('multi-instance platform → agent routing', () => {
 
       expect(pendingTracker.markPending).toHaveBeenCalledWith(
         'myapp', 'claude', 'ch-secondary', 'msg-11', 'claude-2',
+      );
+      expect(pendingTracker.setPromptPreview).toHaveBeenCalledWith(
+        'myapp', 'claude', 'hello', 'claude-2',
       );
     });
 
@@ -265,7 +286,7 @@ describe('multi-instance platform → agent routing', () => {
       const downloaded = [
         { localPath: '/home/user/myapp/.discode/files/img.png', originalName: 'img.png', contentType: 'image/png' },
       ];
-      mockDownloadFileAttachments.mockResolvedValue(downloaded);
+      mockDownloadFileAttachments.mockResolvedValue({ downloaded, skipped: [] });
       mockBuildFileMarkers.mockReturnValue('\n[file:img.png]');
 
       const attachments = [
@@ -289,7 +310,7 @@ describe('multi-instance platform → agent routing', () => {
       const downloaded = [
         { localPath: '/home/user/myapp/.discode/files/doc.pdf', originalName: 'doc.pdf', contentType: 'application/pdf' },
       ];
-      mockDownloadFileAttachments.mockResolvedValue(downloaded);
+      mockDownloadFileAttachments.mockResolvedValue({ downloaded, skipped: [] });
       mockBuildFileMarkers.mockReturnValue('\n[file:doc.pdf]');
 
       const attachments = [
@@ -312,7 +333,7 @@ describe('multi-instance platform → agent routing', () => {
       const downloaded = [
         { localPath: '/home/user/myapp/.discode/files/img.png', originalName: 'img.png', contentType: 'image/png' },
       ];
-      mockDownloadFileAttachments.mockResolvedValue(downloaded);
+      mockDownloadFileAttachments.mockResolvedValue({ downloaded, skipped: [] });
       mockBuildFileMarkers.mockReturnValue('\n[file:img.png]');
 
       const attachments = [
