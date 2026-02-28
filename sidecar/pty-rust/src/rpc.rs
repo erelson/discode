@@ -7,30 +7,92 @@ use crate::session_manager::{
 use crate::vt_lite::build_styled_frame;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const ERROR_INVALID_REQUEST: &str = "INVALID_REQUEST";
+pub const ERROR_INVALID_PARAMS: &str = "INVALID_PARAMS";
+pub const ERROR_UNKNOWN_METHOD: &str = "UNKNOWN_METHOD";
+pub const ERROR_WINDOW_NOT_FOUND: &str = "WINDOW_NOT_FOUND";
+pub const ERROR_REQUEST_TIMEOUT: &str = "REQUEST_TIMEOUT";
+pub const ERROR_INTERNAL: &str = "INTERNAL";
+
 #[derive(Deserialize, Serialize)]
 pub struct RpcRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    #[serde(default, rename = "timeoutMs", skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct RpcError {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Serialize)]
 pub struct RpcResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<RpcError>,
+}
+
+impl RpcError {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+pub fn invalid_request(message: impl Into<String>) -> RpcError {
+    RpcError::new(ERROR_INVALID_REQUEST, message)
+}
+
+pub fn request_timeout(method: &str, timeout_ms: u64, elapsed_ms: u128) -> RpcError {
+    RpcError::new(
+        ERROR_REQUEST_TIMEOUT,
+        format!(
+            "request timed out for method '{method}' (timeout={}ms, elapsed={}ms)",
+            timeout_ms, elapsed_ms
+        ),
+    )
+}
+
+pub fn map_runtime_error(error: String) -> RpcError {
+    if error.starts_with("missing or invalid '") {
+        return RpcError::new(ERROR_INVALID_PARAMS, error);
+    }
+    if error.starts_with("window not found:") {
+        return RpcError::new(ERROR_WINDOW_NOT_FOUND, error);
+    }
+    if error.starts_with("unknown method:") {
+        return RpcError::new(ERROR_UNKNOWN_METHOD, error);
+    }
+    RpcError::new(ERROR_INTERNAL, error)
 }
 
 pub fn handle_request(
     state: &SharedSidecarState,
     req: RpcRequest,
     should_shutdown: &mut bool,
-) -> Result<Value, String> {
+) -> Result<Value, RpcError> {
     match req.method.as_str() {
         "hello" => Ok(json!({ "version": 1 })),
         "get_or_create_session" => {
@@ -75,7 +137,7 @@ pub fn handle_request(
             let window_name = get_str(&req.params, "windowName")?;
             let command = get_str(&req.params, "command")?;
 
-            start_window(state, session_name, window_name, command)?;
+            start_window(state, session_name, window_name, command).map_err(map_runtime_error)?;
             Ok(json!({ "ok": true }))
         }
         "type_keys" => {
@@ -84,7 +146,8 @@ pub fn handle_request(
             let keys = get_str(&req.params, "keys")?;
             with_window(state, &session_name, &window_name, |window| {
                 write_input(window, keys.as_bytes())
-            })?;
+            })
+            .map_err(map_runtime_error)?;
             Ok(json!({ "ok": true }))
         }
         "send_enter" => {
@@ -92,7 +155,8 @@ pub fn handle_request(
             let window_name = get_str(&req.params, "windowName")?;
             with_window(state, &session_name, &window_name, |window| {
                 write_input(window, b"\r")
-            })?;
+            })
+            .map_err(map_runtime_error)?;
             Ok(json!({ "ok": true }))
         }
         "resize_window" => {
@@ -104,7 +168,8 @@ pub fn handle_request(
             with_window(state, &session_name, &window_name, |window| {
                 resize_window(window, cols, rows);
                 Ok(())
-            })?;
+            })
+            .map_err(map_runtime_error)?;
             Ok(json!({ "ok": true }))
         }
         "list_windows" => {
@@ -141,7 +206,8 @@ pub fn handle_request(
             let window_name = get_str(&req.params, "windowName")?;
             let buffer = with_window(state, &session_name, &window_name, |window| {
                 Ok(window.buffer.clone())
-            })?;
+            })
+            .map_err(map_runtime_error)?;
             Ok(json!({ "buffer": buffer }))
         }
         "get_window_frame" => {
@@ -154,14 +220,16 @@ pub fn handle_request(
                 let cols = requested_cols.unwrap_or(window.snapshot.cols);
                 let rows = requested_rows.unwrap_or(window.snapshot.rows);
                 Ok(build_styled_frame(&window.buffer, cols, rows))
-            })?;
+            })
+            .map_err(map_runtime_error)?;
             Ok(frame)
         }
         "stop_window" => {
             let session_name = get_str(&req.params, "sessionName")?;
             let window_name = get_str(&req.params, "windowName")?;
 
-            let stopped = with_window(state, &session_name, &window_name, stop_window)?;
+            let stopped = with_window(state, &session_name, &window_name, stop_window)
+                .map_err(map_runtime_error)?;
 
             Ok(json!({ "stopped": stopped }))
         }
@@ -180,16 +248,19 @@ pub fn handle_request(
             *should_shutdown = true;
             Ok(json!({ "ok": true }))
         }
-        _ => Err(format!("unknown method: {}", req.method)),
+        _ => Err(RpcError::new(
+            ERROR_UNKNOWN_METHOD,
+            format!("unknown method: {}", req.method),
+        )),
     }
 }
 
-fn get_str(params: &Value, key: &str) -> Result<String, String> {
+fn get_str(params: &Value, key: &str) -> Result<String, RpcError> {
     params
         .get(key)
         .and_then(|v| v.as_str())
         .map(|v| v.to_string())
-        .ok_or_else(|| format!("missing or invalid '{key}'"))
+        .ok_or_else(|| RpcError::new(ERROR_INVALID_PARAMS, format!("missing or invalid '{key}'")))
 }
 
 fn get_opt_str(params: &Value, key: &str) -> Option<String> {
@@ -270,8 +341,10 @@ mod tests {
             let _ = handle_request(
                 &self.0,
                 RpcRequest {
+                    id: None,
                     method: "dispose".to_string(),
                     params: json!({}),
+                    timeout_ms: None,
                 },
                 &mut should_shutdown,
             );
@@ -283,8 +356,10 @@ mod tests {
         handle_request(
             state,
             RpcRequest {
+                id: None,
                 method: method.to_string(),
                 params,
+                timeout_ms: None,
             },
             &mut should_shutdown,
         )

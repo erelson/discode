@@ -52,7 +52,7 @@ Exit criteria:
 ## Phase 2 - Runtime Transport and Execution Model Hardening
 
 - [x] replace request-per-process client pattern with persistent RPC connection model (persistent `client` bridge + line-delimited RPC over single socket connection)
-- [ ] introduce request ids, timeouts, and explicit error codes
+- [x] introduce request ids, timeouts, and explicit error codes
 - [ ] implement sidecar heartbeat/health method
 - [ ] add controlled shutdown and socket/pipe cleanup guarantees
 - [ ] add observability: per-method latency/error counters and sidecar startup metrics

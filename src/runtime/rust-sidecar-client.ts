@@ -7,8 +7,9 @@ import type { TerminalStyledFrame } from './vt-screen.js';
 
 type SidecarRpcResponse<T = unknown> = {
   ok: boolean;
+  id?: number;
   result?: T;
-  error?: string;
+  error?: string | { code?: string; message?: string };
 };
 
 type SidecarOptions = {
@@ -27,6 +28,7 @@ export class RustSidecarClient {
   private clientStdoutFd?: number;
   private clientReadBuffer = Buffer.alloc(0);
   private requestTimeoutMs = 1500;
+  private nextRequestId = 1;
   private available = false;
 
   constructor(options?: SidecarOptions) {
@@ -255,7 +257,13 @@ export class RustSidecarClient {
       return this.requestViaCommand(method, params || {});
     }
 
-    const payload = `${JSON.stringify({ method, params: params || {} })}\n`;
+    const requestId = this.allocateRequestId();
+    const payload = `${JSON.stringify({
+      id: requestId,
+      method,
+      params: params || {},
+      timeoutMs: this.requestTimeoutMs,
+    })}\n`;
 
     try {
       writeAllSync(this.clientStdinFd, Buffer.from(payload, 'utf8'));
@@ -268,8 +276,10 @@ export class RustSidecarClient {
         throw new Error(`invalid sidecar response for ${method}: ${normalizeLogText(line) || 'empty response'}`);
       }
 
+      this.assertResponseId(method, requestId, parsed.id);
+
       if (!parsed.ok) {
-        throw new Error(parsed.error || `sidecar error for ${method}`);
+        throw new Error(formatSidecarRpcError(method, parsed.error));
       }
 
       return parsed.result as T;
@@ -284,10 +294,16 @@ export class RustSidecarClient {
       throw new Error('Rust sidecar binary not configured');
     }
 
+    const requestId = this.allocateRequestId();
+
     const commandArgs = [
       'request',
       '--socket',
       this.socketPath,
+      '--id',
+      String(requestId),
+      '--timeout-ms',
+      String(this.requestTimeoutMs),
       '--method',
       method,
       '--params',
@@ -296,7 +312,7 @@ export class RustSidecarClient {
 
     const result = spawnSync(this.binaryPath, commandArgs, {
       encoding: 'utf8',
-      timeout: 1500,
+      timeout: this.requestTimeoutMs,
     });
 
     if (result.error || result.status !== 0) {
@@ -331,11 +347,31 @@ export class RustSidecarClient {
       throw new Error(`invalid sidecar response for ${method}: ${normalizeLogText(result.stdout || '') || 'empty stdout'}`);
     }
 
+    this.assertResponseId(method, requestId, payload.id);
+
     if (!payload.ok) {
-      throw new Error(payload.error || `sidecar error for ${method}`);
+      throw new Error(formatSidecarRpcError(method, payload.error));
     }
 
     return payload.result as T;
+  }
+
+  private allocateRequestId(): number {
+    const current = this.nextRequestId;
+    this.nextRequestId += 1;
+    if (this.nextRequestId > Number.MAX_SAFE_INTEGER) {
+      this.nextRequestId = 1;
+    }
+    return current;
+  }
+
+  private assertResponseId(method: string, requestId: number, responseId: number | undefined): void {
+    if (responseId === undefined) {
+      return;
+    }
+    if (!Number.isInteger(responseId) || responseId !== requestId) {
+      throw new Error(`sidecar response id mismatch for ${method}: expected=${requestId}, received=${String(responseId)}`);
+    }
   }
 
   private readClientLine(): string {
@@ -420,6 +456,28 @@ function normalizeLogText(input: string, maxLength: number = 240): string {
   if (!compact) return '';
   if (compact.length <= maxLength) return compact;
   return `${compact.slice(0, maxLength - 3)}...`;
+}
+
+function formatSidecarRpcError(
+  method: string,
+  error: string | { code?: string; message?: string } | undefined,
+): string {
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  const code = error?.code?.trim();
+  const message = error?.message?.trim();
+  if (code && message) {
+    return `[${code}] ${message}`;
+  }
+  if (code) {
+    return `[${code}] sidecar error for ${method}`;
+  }
+  if (message) {
+    return message;
+  }
+  return `sidecar error for ${method}`;
 }
 
 function resolveSidecarBinaryPath(explicitPath?: string): string | null {

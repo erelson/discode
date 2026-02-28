@@ -30,7 +30,9 @@ fn main() {
 
 #[cfg(unix)]
 mod unix_main {
-    use crate::rpc::{handle_request, RpcRequest, RpcResponse};
+    use crate::rpc::{
+        handle_request, invalid_request, request_timeout, RpcError, RpcRequest, RpcResponse,
+    };
     use crate::session_manager::new_shared_state;
     use serde_json::{json, Value};
     use std::fs;
@@ -39,7 +41,7 @@ mod unix_main {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     pub fn main() {
         let args = std::env::args().collect::<Vec<_>>();
@@ -68,10 +70,17 @@ mod unix_main {
                     eprintln!("missing --method");
                     std::process::exit(1);
                 });
+                let id = parse_flag_u64(&args, "--id");
+                let timeout_ms = parse_flag_u64(&args, "--timeout-ms");
                 let params = parse_flag(&args, "--params")
                     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                     .unwrap_or_else(|| json!({}));
-                let req = RpcRequest { method, params };
+                let req = RpcRequest {
+                    id,
+                    method,
+                    params,
+                    timeout_ms,
+                };
 
                 match send_request(Path::new(&socket), &req) {
                     Ok(value) => {
@@ -103,6 +112,10 @@ mod unix_main {
     fn parse_flag(args: &[String], name: &str) -> Option<String> {
         let idx = args.iter().position(|it| it == name)?;
         args.get(idx + 1).cloned()
+    }
+
+    fn parse_flag_u64(args: &[String], name: &str) -> Option<u64> {
+        parse_flag(args, name).and_then(|raw| raw.parse::<u64>().ok())
     }
 
     fn send_request(socket_path: &Path, req: &RpcRequest) -> Result<String, String> {
@@ -147,8 +160,9 @@ mod unix_main {
                     &mut stream,
                     &RpcResponse {
                         ok: false,
+                        id: None,
                         result: None,
-                        error: Some(err),
+                        error: Some(RpcError::new("INTERNAL", err)),
                     },
                 );
             }
@@ -191,22 +205,52 @@ mod unix_main {
                 break;
             }
 
-            let req = serde_json::from_str::<RpcRequest>(raw.trim())
-                .map_err(|e| format!("invalid request JSON: {e}"))?;
+            let req = match serde_json::from_str::<RpcRequest>(raw.trim()) {
+                Ok(req) => req,
+                Err(err) => {
+                    let response = RpcResponse {
+                        ok: false,
+                        id: None,
+                        result: None,
+                        error: Some(invalid_request(format!("invalid request JSON: {err}"))),
+                    };
+                    write_response(stream, &response)?;
+                    continue;
+                }
+            };
+
+            let request_id = req.id;
+            let timeout_ms = req.timeout_ms;
+            let method_name = req.method.clone();
+            let started_at = Instant::now();
 
             let mut should_shutdown = false;
-            let response = match handle_request(state, req, &mut should_shutdown) {
+            let mut response = match handle_request(state, req, &mut should_shutdown) {
                 Ok(value) => RpcResponse {
                     ok: true,
+                    id: request_id,
                     result: Some(value),
                     error: None,
                 },
                 Err(err) => RpcResponse {
                     ok: false,
+                    id: request_id,
                     result: None,
                     error: Some(err),
                 },
             };
+
+            if let Some(limit_ms) = timeout_ms {
+                let elapsed_ms = started_at.elapsed().as_millis();
+                if elapsed_ms > u128::from(limit_ms) {
+                    response = RpcResponse {
+                        ok: false,
+                        id: request_id,
+                        result: None,
+                        error: Some(request_timeout(&method_name, limit_ms, elapsed_ms)),
+                    };
+                }
+            }
 
             write_response(stream, &response)?;
             if should_shutdown {
