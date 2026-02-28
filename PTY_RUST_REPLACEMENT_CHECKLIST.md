@@ -38,8 +38,8 @@ Exit criteria:
 ## Phase 1 - Sidecar Skeleton Refactor (No Behavior Change)
 
 - [x] create module tree in `sidecar/pty-rust/src/` (`pty_bus`, `terminal_pane`, `grid_scrollback`, `screen`, `renderer`, `session_manager`, `rpc`)
-- [ ] move window/session state out of `main.rs` into `session_manager`
-- [ ] move PTY spawn/read/write/resize into `pty_bus`
+- [x] move window/session state out of `main.rs` into `session_manager` (state structs/registry + locking/window access helpers moved)
+- [x] move PTY spawn/read/write/resize into `pty_bus` (`spawn_window_process`, `write_input`, `resize_window`, `stop_window`, `dispose_window`)
 - [ ] move VT-lite parser logic into `terminal_pane` + `grid_scrollback`
 - [ ] keep existing RPC methods working via adapters
 - [ ] add integration tests to prove behavior equivalence after moves

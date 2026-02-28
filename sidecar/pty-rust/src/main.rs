@@ -30,18 +30,23 @@ fn main() {
 
 #[cfg(unix)]
 mod unix_main {
+    use crate::pty_bus::{
+        dispose_window, resize_window as resize_window_bus, spawn_window_process,
+        stop_window as stop_window_bus, write_input,
+    };
+    use crate::session_manager::{
+        idle_window_state, lock_state, lock_window, new_shared_state, window_key, with_window,
+        SharedSidecarState,
+    };
     use crate::vt_lite::build_styled_frame;
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
-    use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Deserialize, Serialize)]
@@ -58,44 +63,6 @@ mod unix_main {
         result: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-    }
-
-    #[derive(Clone)]
-    struct WindowSnapshot {
-        session_name: String,
-        window_name: String,
-        status: String,
-        pid: Option<u32>,
-        started_at: Option<i64>,
-        exited_at: Option<i64>,
-        exit_code: Option<i32>,
-        signal: Option<String>,
-        cols: u16,
-        rows: u16,
-    }
-
-    struct WindowState {
-        snapshot: WindowSnapshot,
-        buffer: String,
-        writer: Option<Box<dyn Write + Send>>,
-        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-        child: Option<Box<dyn portable_pty::Child + Send>>,
-    }
-
-    struct SidecarState {
-        sessions: HashMap<String, HashMap<String, String>>,
-        windows: HashMap<String, Arc<Mutex<WindowState>>>,
-        max_buffer_bytes: usize,
-    }
-
-    impl SidecarState {
-        fn new() -> Self {
-            Self {
-                sessions: HashMap::new(),
-                windows: HashMap::new(),
-                max_buffer_bytes: 512 * 1024,
-            }
-        }
     }
 
     pub fn main() {
@@ -180,7 +147,7 @@ mod unix_main {
 
         let listener = UnixListener::bind(&socket_path)
             .map_err(|e| format!("bind {}: {e}", socket_path.display()))?;
-        let state = Arc::new(Mutex::new(SidecarState::new()));
+        let state = new_shared_state();
         let running = Arc::new(AtomicBool::new(true));
 
         while running.load(Ordering::SeqCst) {
@@ -249,7 +216,7 @@ mod unix_main {
     }
 
     fn handle_request(
-        state: &Arc<Mutex<SidecarState>>,
+        state: &SharedSidecarState,
         req: RpcRequest,
         should_shutdown: &mut bool,
     ) -> Result<Value, String> {
@@ -259,35 +226,16 @@ mod unix_main {
                 let project_name = get_str(&req.params, "projectName")?;
                 let first_window_name = get_opt_str(&req.params, "firstWindowName");
 
-                let mut guard = state
-                    .lock()
-                    .map_err(|_| "state lock poisoned".to_string())?;
-                guard
-                    .sessions
-                    .entry(project_name.clone())
-                    .or_insert_with(HashMap::new);
+                let mut guard = lock_state(state);
+                guard.sessions.entry(project_name.clone()).or_default();
 
                 if let Some(window_name) = first_window_name {
                     let key = window_key(&project_name, &window_name);
                     guard.windows.entry(key).or_insert_with(|| {
-                        Arc::new(Mutex::new(WindowState {
-                            snapshot: WindowSnapshot {
-                                session_name: project_name.clone(),
-                                window_name,
-                                status: "idle".to_string(),
-                                pid: None,
-                                started_at: None,
-                                exited_at: None,
-                                exit_code: None,
-                                signal: None,
-                                cols: 140,
-                                rows: 40,
-                            },
-                            buffer: String::new(),
-                            writer: None,
-                            master: None,
-                            child: None,
-                        }))
+                        Arc::new(Mutex::new(idle_window_state(
+                            project_name.clone(),
+                            window_name,
+                        )))
                     });
                 }
 
@@ -298,13 +246,8 @@ mod unix_main {
                 let key = get_str(&req.params, "key")?;
                 let value = get_str(&req.params, "value")?;
 
-                let mut guard = state
-                    .lock()
-                    .map_err(|_| "state lock poisoned".to_string())?;
-                let env = guard
-                    .sessions
-                    .entry(session_name)
-                    .or_insert_with(HashMap::new);
+                let mut guard = lock_state(state);
+                let env = guard.sessions.entry(session_name).or_default();
                 env.insert(key, value);
                 Ok(json!({ "ok": true }))
             }
@@ -313,9 +256,7 @@ mod unix_main {
                 let window_name = get_str(&req.params, "windowName")?;
                 let key = window_key(&session_name, &window_name);
 
-                let guard = state
-                    .lock()
-                    .map_err(|_| "state lock poisoned".to_string())?;
+                let guard = lock_state(state);
                 Ok(json!({ "exists": guard.windows.contains_key(&key) }))
             }
             "start_window" => {
@@ -331,15 +272,7 @@ mod unix_main {
                 let window_name = get_str(&req.params, "windowName")?;
                 let keys = get_str(&req.params, "keys")?;
                 with_window(state, &session_name, &window_name, |window| {
-                    let writer = window
-                        .writer
-                        .as_mut()
-                        .ok_or_else(|| "window writer unavailable".to_string())?;
-                    writer
-                        .write_all(keys.as_bytes())
-                        .map_err(|e| format!("write keys failed: {e}"))?;
-                    writer.flush().map_err(|e| format!("flush failed: {e}"))?;
-                    Ok(())
+                    write_input(window, keys.as_bytes())
                 })?;
                 Ok(json!({ "ok": true }))
             }
@@ -347,15 +280,7 @@ mod unix_main {
                 let session_name = get_str(&req.params, "sessionName")?;
                 let window_name = get_str(&req.params, "windowName")?;
                 with_window(state, &session_name, &window_name, |window| {
-                    let writer = window
-                        .writer
-                        .as_mut()
-                        .ok_or_else(|| "window writer unavailable".to_string())?;
-                    writer
-                        .write_all(b"\r")
-                        .map_err(|e| format!("write enter failed: {e}"))?;
-                    writer.flush().map_err(|e| format!("flush failed: {e}"))?;
-                    Ok(())
+                    write_input(window, b"\r")
                 })?;
                 Ok(json!({ "ok": true }))
             }
@@ -366,16 +291,7 @@ mod unix_main {
                 let rows = get_u16(&req.params, "rows", 40);
 
                 with_window(state, &session_name, &window_name, |window| {
-                    if let Some(master) = window.master.as_mut() {
-                        let _ = master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
-                    }
-                    window.snapshot.cols = cols;
-                    window.snapshot.rows = rows;
+                    resize_window_bus(window, cols, rows);
                     Ok(())
                 })?;
                 Ok(json!({ "ok": true }))
@@ -383,9 +299,7 @@ mod unix_main {
             "list_windows" => {
                 let session_filter = get_opt_str(&req.params, "sessionName");
                 let windows = {
-                    let guard = state
-                        .lock()
-                        .map_err(|_| "state lock poisoned".to_string())?;
+                    let guard = lock_state(state);
                     guard
                         .windows
                         .values()
@@ -437,40 +351,20 @@ mod unix_main {
                 let window_name = get_str(&req.params, "windowName")?;
 
                 let stopped = with_window(state, &session_name, &window_name, |window| {
-                    if let Some(child) = window.child.as_mut() {
-                        child.kill().map_err(|e| format!("kill failed: {e}"))?;
-                        window.snapshot.status = "exited".to_string();
-                        window.snapshot.exited_at = Some(now_unix_seconds());
-                        window.snapshot.signal = Some("SIGTERM".to_string());
-                        window.child = None;
-                        window.master = None;
-                        window.writer = None;
-                        Ok(true)
-                    } else {
-                        Ok(false)
-                    }
+                    stop_window_bus(window)
                 })?;
 
                 Ok(json!({ "stopped": stopped }))
             }
             "dispose" => {
                 let windows = {
-                    let guard = state
-                        .lock()
-                        .map_err(|_| "state lock poisoned".to_string())?;
+                    let guard = lock_state(state);
                     guard.windows.values().cloned().collect::<Vec<_>>()
                 };
 
                 for window in windows {
                     if let Ok(mut window) = window.lock() {
-                        if let Some(child) = window.child.as_mut() {
-                            let _ = child.kill();
-                        }
-                        window.child = None;
-                        window.writer = None;
-                        window.master = None;
-                        window.snapshot.status = "exited".to_string();
-                        window.snapshot.exited_at = Some(now_unix_seconds());
+                        dispose_window(&mut window);
                     }
                 }
 
@@ -505,44 +399,13 @@ mod unix_main {
         get_opt_u16(params, key).unwrap_or(default)
     }
 
-    fn window_key(session_name: &str, window_name: &str) -> String {
-        format!("{session_name}:{window_name}")
-    }
-
-    fn with_window<T>(
-        state: &Arc<Mutex<SidecarState>>,
-        session_name: &str,
-        window_name: &str,
-        mut f: impl FnMut(&mut WindowState) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let key = window_key(session_name, window_name);
-        let window = {
-            let guard = lock_state(state);
-            guard
-                .windows
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| format!("window not found: {key}"))?
-        };
-        let mut guard = lock_window(&window);
-        f(&mut guard)
-    }
-
     fn start_window(
-        state: &Arc<Mutex<SidecarState>>,
+        state: &SharedSidecarState,
         session_name: String,
         window_name: String,
         command: String,
     ) -> Result<(), String> {
         let key = window_key(&session_name, &window_name);
-        let env = {
-            let guard = lock_state(state);
-            guard
-                .sessions
-                .get(&session_name)
-                .cloned()
-                .unwrap_or_default()
-        };
 
         let window = {
             let mut guard = lock_state(state);
@@ -550,29 +413,15 @@ mod unix_main {
                 .windows
                 .entry(key)
                 .or_insert_with(|| {
-                    Arc::new(Mutex::new(WindowState {
-                        snapshot: WindowSnapshot {
-                            session_name: session_name.clone(),
-                            window_name: window_name.clone(),
-                            status: "idle".to_string(),
-                            pid: None,
-                            started_at: None,
-                            exited_at: None,
-                            exit_code: None,
-                            signal: None,
-                            cols: 140,
-                            rows: 40,
-                        },
-                        buffer: String::new(),
-                        writer: None,
-                        master: None,
-                        child: None,
-                    }))
+                    Arc::new(Mutex::new(idle_window_state(
+                        session_name.clone(),
+                        window_name.clone(),
+                    )))
                 })
                 .clone()
         };
 
-        let (cols, rows) = {
+        {
             let mut w = lock_window(&window);
             if w.child.is_some() && w.snapshot.status == "running" {
                 return Ok(());
@@ -583,135 +432,11 @@ mod unix_main {
             w.snapshot.exit_code = None;
             w.snapshot.signal = None;
             w.buffer.clear();
-            (w.snapshot.cols, w.snapshot.rows)
-        };
-
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("openpty failed: {e}"))?;
-
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg("-lc");
-        cmd.arg(command);
-        cmd.cwd(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        cmd.env(
-            "TERM",
-            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
-        );
-        cmd.env(
-            "COLORTERM",
-            std::env::var("COLORTERM").unwrap_or_else(|_| "truecolor".to_string()),
-        );
-        cmd.env("COLUMNS", cols.to_string());
-        cmd.env("LINES", rows.to_string());
-        for (k, v) in env {
-            cmd.env(k, v);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("spawn failed: {e}"))?;
-        let pid = child.process_id();
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("clone reader failed: {e}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("take writer failed: {e}"))?;
-
-        {
-            let mut w = lock_window(&window);
-            w.snapshot.status = "running".to_string();
-            w.snapshot.pid = pid;
-            w.master = Some(pair.master);
-            w.child = Some(child);
-            w.writer = Some(writer);
-            w.buffer.push_str(&format!(
-                "[runtime] process started (pid={})\n",
-                pid.unwrap_or(0)
-            ));
-        }
-
-        let max_buffer = {
-            let guard = lock_state(state);
-            guard.max_buffer_bytes
-        };
-
-        let read_window = window.clone();
-        thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        if let Ok(mut w) = read_window.lock() {
-                            if w.snapshot.status == "running" || w.snapshot.status == "starting" {
-                                w.snapshot.status = "exited".to_string();
-                                w.snapshot.exited_at = Some(now_unix_seconds());
-                            }
-                        }
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Ok(mut w) = read_window.lock() {
-                            let text = String::from_utf8_lossy(&buf[..n]);
-                            w.buffer.push_str(&text);
-                            if w.buffer.len() > max_buffer {
-                                trim_buffer_to_max_bytes(&mut w.buffer, max_buffer);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        if let Ok(mut w) = read_window.lock() {
-                            w.snapshot.status = "error".to_string();
-                            w.snapshot.exited_at = Some(now_unix_seconds());
-                        }
-                        break;
-                    }
-                }
-            }
-        });
+        spawn_window_process(state, &window, &session_name, command)?;
 
         Ok(())
-    }
-
-    fn lock_state<'a>(
-        state: &'a Arc<Mutex<SidecarState>>,
-    ) -> std::sync::MutexGuard<'a, SidecarState> {
-        state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn lock_window<'a>(
-        window: &'a Arc<Mutex<WindowState>>,
-    ) -> std::sync::MutexGuard<'a, WindowState> {
-        window
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn trim_buffer_to_max_bytes(buffer: &mut String, max_bytes: usize) {
-        if buffer.len() <= max_bytes {
-            return;
-        }
-
-        let overflow = buffer.len() - max_bytes;
-        let mut start = overflow;
-        while start < buffer.len() && !buffer.is_char_boundary(start) {
-            start += 1;
-        }
-
-        buffer.drain(..start);
     }
 
     fn now_unix_seconds() -> i64 {
